@@ -47,10 +47,23 @@ deidentify preview /path/to/project fingerprint.json --output preview.json
 deidentify audit-request /path/to/project fingerprint.json --output audit-request.json
 # Submit audit-request.json to sanctioned internal AI and save its response.
 deidentify build /path/to/project fingerprint.json output/project-deidentified.tar.gz \
-  --audit-findings audit-response.json --fail-on-ai-findings
+  --audit-findings audit-response.json --fail-on-ai-findings \
+  --mapping-vault secure/project-mapping.vault.json
+
+# After ChatGPT returns a modified tarball, restore it only in an approved local environment.
+deidentify reidentify returned-from-chatgpt.tar.gz secure/project-mapping.vault.json \
+  restored-internal.tar.gz
 ```
 
 `--copilot-request` remains a compatible alias for `--ai-review-request`; the request content is provider-neutral.
+
+## Optional reidentification
+
+By default, no reverse map is kept. Add `--mapping-vault` at build time only when you need to restore approved internal names after an external AI returns a modified archive. The CLI prompts for a passphrase and writes a separate encrypted vault using PBKDF2-HMAC-SHA256 and authenticated Fernet encryption. The vault is never included in the deidentified archive or manifest and must remain outside the source tree.
+
+`reidentify` reads a returned tarball without extracting it, rejects symlinks, unsafe paths, non-regular members, binary/non-UTF-8/unsupported files, and path collisions, then creates a fresh local tarball with normalised metadata. It never modifies the returned archive.
+
+Reidentification restores the approved **canonical** value for each token. Because deidentification intentionally maps several spelling/case variants to the same token, it cannot reconstruct every original spelling byte-for-byte. Keep the vault and its passphrase as sensitive credentials; losing either makes reidentification impossible.
 
 ## Discovery and review
 

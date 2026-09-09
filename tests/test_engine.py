@@ -1,10 +1,11 @@
 import os
+import shutil
 import tarfile
 import tempfile
 import unittest
 from pathlib import Path
 
-from deidentify.engine import MAX_FILE_BYTES, ai_review_request, audit_request, build, build_plan, import_review, initial_fingerprint, preview, scan
+from deidentify.engine import MAX_FILE_BYTES, ai_review_request, audit_request, build, build_plan, import_review, initial_fingerprint, preview, reidentify, scan
 
 
 def approved(*entries):
@@ -185,6 +186,36 @@ class EngineTests(unittest.TestCase):
             fingerprint = approved(("Orion", "project", ["Orion", "<PROJECT_001>"]))
             with self.assertRaisesRegex(ValueError, "Final check"):
                 build(root, fingerprint, parent / "release.tar.gz")
+
+    def test_encrypted_mapping_vault_reidentifies_to_canonical_values(self):
+        with tempfile.TemporaryDirectory() as name:
+            parent = Path(name); root = self.source(parent); (root / "Orion.yml").write_text("service: orion-api\n", encoding="utf-8")
+            fingerprint = approved(("Orion Payments", "internal_product", ["Orion", "orion-api"]))
+            deidentified = parent / "deidentified.tar.gz"; vault = parent / "mapping.vault.json"
+            build(root, fingerprint, deidentified, vault_path=vault, vault_passphrase="correct horse battery staple")
+            self.assertNotIn("Orion Payments", vault.read_text(encoding="utf-8"))
+            returned = parent / "returned.tar.gz"; shutil.copyfile(deidentified, returned)
+            restored = parent / "restored.tar.gz"
+            manifest = reidentify(returned, vault, restored, "correct horse battery staple")
+            self.assertEqual("<INTERNAL_PRODUCT_001>.yml", self.archive_names(deidentified).pop())
+            self.assertEqual({"Orion Payments.yml"}, self.archive_names(restored))
+            self.assertIn("Orion Payments", self.archive_text(restored, "Orion Payments.yml"))
+            self.assertEqual(2, manifest["reidentified_token_occurrences"])
+            with self.assertRaisesRegex(ValueError, "Could not decrypt"):
+                reidentify(returned, vault, parent / "wrong.tar.gz", "wrong passphrase")
+
+    def test_reidentify_rejects_unsafe_returned_archive_members(self):
+        with tempfile.TemporaryDirectory() as name:
+            parent = Path(name); vault = parent / "mapping.vault.json"
+            fingerprint = approved(("Orion", "project", ["Orion"]))
+            from deidentify.engine import write_mapping_vault
+            write_mapping_vault(vault, fingerprint, "passphrase")
+            returned = parent / "returned.tar.gz"
+            with tarfile.open(returned, "w:gz") as archive:
+                link = tarfile.TarInfo("link.yml"); link.type = tarfile.SYMTYPE; link.linkname = "/outside"
+                archive.addfile(link)
+            with self.assertRaisesRegex(ValueError, "non-regular"):
+                reidentify(returned, vault, parent / "restored.tar.gz", "passphrase")
 
 
 if __name__ == "__main__":

@@ -7,10 +7,17 @@ import re
 import stat
 import tarfile
 import tempfile
+from base64 import urlsafe_b64decode, urlsafe_b64encode
+from io import BytesIO
+from pathlib import PurePosixPath
 from collections import Counter, defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterable
+
+from cryptography.fernet import Fernet, InvalidToken
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 
 VERSION = "0.2.0"
@@ -264,6 +271,42 @@ def approved_replacements(fingerprint: dict[str, Any]) -> list[tuple[str, str, s
     return sorted(replacements, key=lambda item: len(item[0]), reverse=True)
 
 
+def mapping_vault(fingerprint: dict[str, Any], passphrase: str) -> dict[str, Any]:
+    if not passphrase:
+        raise ValueError("Mapping-vault passphrase must not be empty")
+    token_map: dict[str, str] = {}
+    for _, token, canonical in approved_replacements(fingerprint):
+        token_map[token] = canonical
+    if not token_map:
+        raise ValueError("No approved mappings available for a vault")
+    salt = os.urandom(16)
+    key = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=600_000).derive(passphrase.encode("utf-8"))
+    plaintext = json.dumps({"schema_version": 1, "token_map": token_map}, sort_keys=True).encode("utf-8")
+    return {"schema_version": 1, "kdf": {"name": "PBKDF2-HMAC-SHA256", "iterations": 600_000, "salt": urlsafe_b64encode(salt).decode("ascii")}, "ciphertext": Fernet(urlsafe_b64encode(key)).encrypt(plaintext).decode("ascii")}
+
+
+def write_mapping_vault(path: Path, fingerprint: dict[str, Any], passphrase: str) -> None:
+    if path.exists():
+        raise ValueError(f"Refusing to overwrite existing mapping vault: {path}")
+    write_json(path, mapping_vault(fingerprint, passphrase))
+
+
+def decrypt_mapping_vault(path: Path, passphrase: str) -> dict[str, str]:
+    vault = load_json(path)
+    kdf = vault.get("kdf", {})
+    if vault.get("schema_version") != 1 or kdf.get("name") != "PBKDF2-HMAC-SHA256" or not isinstance(kdf.get("iterations"), int) or not isinstance(kdf.get("salt"), str) or not isinstance(vault.get("ciphertext"), str):
+        raise ValueError("Unsupported mapping vault")
+    try:
+        key = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=urlsafe_b64decode(kdf["salt"]), iterations=kdf["iterations"]).derive(passphrase.encode("utf-8"))
+        data = json.loads(Fernet(urlsafe_b64encode(key)).decrypt(vault["ciphertext"].encode("ascii")))
+    except (InvalidToken, ValueError, TypeError, UnicodeDecodeError) as exc:
+        raise ValueError("Could not decrypt mapping vault; check the passphrase and vault file") from exc
+    token_map = data.get("token_map") if isinstance(data, dict) else None
+    if not isinstance(token_map, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in token_map.items()):
+        raise ValueError("Mapping vault contains an invalid token map")
+    return token_map
+
+
 def replace_text(text: str, replacements: list[tuple[str, str, str]]) -> tuple[str, set[str], int]:
     applied: set[str] = set(); count = 0
     for variant, token, canonical in replacements:
@@ -328,8 +371,9 @@ def substantive_audit_findings(audit: dict[str, Any]) -> list[dict[str, Any]]:
     return result
 
 
-def build(source: Path, fingerprint: dict[str, Any], output: Path, unsupported_policy: str = "reject", audit: dict[str, Any] | None = None, fail_on_ai_findings: bool = False) -> dict[str, Any]:
+def build(source: Path, fingerprint: dict[str, Any], output: Path, unsupported_policy: str = "reject", audit: dict[str, Any] | None = None, fail_on_ai_findings: bool = False, vault_path: Path | None = None, vault_passphrase: str | None = None) -> dict[str, Any]:
     if fail_on_ai_findings and audit is None: raise ValueError("--fail-on-ai-findings requires an audit findings file")
+    if (vault_path is None) != (vault_passphrase is None): raise ValueError("A mapping vault path and passphrase must be supplied together")
     substantive = substantive_audit_findings(audit) if audit is not None else []
     if fail_on_ai_findings and substantive: raise ValueError(f"Adversarial AI audit has {len(substantive)} open medium/high findings; archive blocked")
     require_outside_source(source, output, "Archive output")
@@ -351,5 +395,62 @@ def build(source: Path, fingerprint: dict[str, Any], output: Path, unsupported_p
                 with destination.open("rb") as stream: archive.addfile(info, stream)
     checksum = hashlib.sha256(output.read_bytes()).hexdigest()
     manifest = {"schema_version": 2, "tool_version": VERSION, "created_at": utc_now(), "archive": {"filename": output.name, "sha256": checksum, "file_count": len(plan), "metadata_normalised": True}, "fingerprint": {"approved_entry_count": sum(e["status"] == "approved" for e in fingerprint["entries"]), "entries_applied": len({name for item in plan for name in item["applied"]})}, "omitted_files": omitted, "final_check": {"passed": True, "unresolved_approved_variants": 0, "paths_checked": True}, "ai_audit": {"performed": audit is not None, "open_medium_or_high_findings": len(substantive)}, "notes": ["No original-to-replacement map is stored in this manifest."]}
+    write_json(output.with_suffix(output.suffix + ".manifest.json"), manifest)
+    if vault_path is not None:
+        write_mapping_vault(vault_path, fingerprint, vault_passphrase or "")
+    return manifest
+
+
+def safe_archive_relative(name: str) -> Path:
+    raw = PurePosixPath(name)
+    if raw.is_absolute() or not raw.parts or any(part in {"", ".", ".."} for part in raw.parts):
+        raise ValueError(f"Unsafe path in returned archive: {name}")
+    return Path(*raw.parts)
+
+
+def reidentify(returned_archive: Path, vault_path: Path, output: Path, passphrase: str) -> dict[str, Any]:
+    """Restore canonical values from an encrypted vault into a new local tarball."""
+    if output.exists() or output.with_suffix(output.suffix + ".manifest.json").exists():
+        raise ValueError("Refusing to overwrite an existing reidentified archive or manifest")
+    token_map = decrypt_mapping_vault(vault_path, passphrase)
+    replacements = sorted([(token, canonical, token) for token, canonical in token_map.items()], key=lambda item: len(item[0]), reverse=True)
+    restored: list[tuple[Path, bytes, int]] = []; targets: dict[str, str] = {}
+    try:
+        archive = tarfile.open(returned_archive, "r:*")
+    except (OSError, tarfile.TarError) as exc:
+        raise ValueError(f"Cannot read returned archive: {exc}") from exc
+    with archive:
+        for member in archive.getmembers():
+            if not member.isfile():
+                raise ValueError(f"Returned archive contains non-regular member: {member.name}")
+            relative = safe_archive_relative(member.name)
+            if member.size > MAX_FILE_BYTES:
+                raise ValueError(f"Returned archive member exceeds {MAX_FILE_BYTES} bytes: {member.name}")
+            stream = archive.extractfile(member)
+            raw = stream.read() if stream else b""
+            if relative.suffix.lower() not in TEXT_EXTENSIONS and relative.name not in EXTENSIONLESS_TEXT:
+                raise ValueError(f"Returned archive has unsupported file type: {member.name}")
+            if b"\x00" in raw:
+                raise ValueError(f"Returned archive has binary content: {member.name}")
+            try:
+                text = raw.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError(f"Returned archive is not UTF-8 text: {member.name}") from exc
+            target, _, path_count = transformed_relative(relative, replacements)
+            target_name = target.as_posix()
+            collision = next((existing for existing in targets if target_name == existing or target_name.startswith(existing + "/") or existing.startswith(target_name + "/")), None)
+            if collision:
+                raise ValueError(f"Path collision while reidentifying: {targets[collision]} and {member.name}")
+            targets[target_name] = member.name
+            restored_text, _, content_count = replace_text(text, replacements)
+            if remaining_approved(target.as_posix(), replacements) or remaining_approved(restored_text, replacements):
+                raise ValueError(f"Reidentification left vault tokens in {member.name}")
+            restored.append((target, restored_text.encode("utf-8"), path_count + content_count))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(output, "w:gz") as archive:
+        for target, raw, _ in sorted(restored, key=lambda item: item[0].as_posix()):
+            info = tarfile.TarInfo(target.as_posix()); info.size = len(raw); info.mode = 0o644; info.uid = info.gid = 0; info.uname = info.gname = ""; info.mtime = 0
+            archive.addfile(info, BytesIO(raw))
+    manifest = {"schema_version": 1, "tool_version": VERSION, "created_at": utc_now(), "archive": {"filename": output.name, "sha256": hashlib.sha256(output.read_bytes()).hexdigest(), "file_count": len(restored), "metadata_normalised": True}, "reidentified_token_occurrences": sum(count for _, _, count in restored), "notes": ["Canonical values were restored from an encrypted mapping vault; original spelling variants are not reconstructed."]}
     write_json(output.with_suffix(output.suffix + ".manifest.json"), manifest)
     return manifest
