@@ -254,6 +254,7 @@ class EngineTests(unittest.TestCase):
     def test_portable_tokens_and_short_variant_acknowledgement(self):
         with tempfile.TemporaryDirectory() as name:
             parent = Path(name); root = self.source(parent); (root / "AD.yml").write_text("AD AD", encoding="utf-8")
+            (root / "dirAD").mkdir(); (root / "dirAD" / "other.yml").write_text("aD", encoding="utf-8")
             fingerprint = approved(("AD", "project", ["AD"]))
             token = approved_replacements(fingerprint)[0][1]
             self.assertFalse(set(token) & set('<>:"/\\|?*'))
@@ -261,6 +262,8 @@ class EngineTests(unittest.TestCase):
             preview_data = preview(root, fingerprint)
             self.assertEqual(2, preview_data["short_variant_risks"][0]["length"])
             self.assertFalse(preview_data["short_variant_risks"][0]["acknowledged"])
+            self.assertEqual(2, preview_data["short_variant_risks"][0]["affected_files"])
+            self.assertEqual(5, preview_data["short_variant_risks"][0]["occurrences"])
             with self.assertRaisesRegex(ValueError, "shorter than 4"):
                 build(root, fingerprint, parent / "blocked.tar.gz")
             fingerprint["entries"][0]["short_variant_acknowledgements"] = {"AD": "Approved by release reviewer; this acronym must be removed."}

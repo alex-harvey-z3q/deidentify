@@ -15,6 +15,7 @@ The tool reduces accidental disclosure of company, customer, project, internal-s
 - Builds fail for transformed-path collisions, unsafe output paths, approved terms left in staged paths/content, or unsupported files under the default policy.
 - Builds refuse to overwrite an existing archive or manifest.
 - Archive owner/group/timestamp metadata is normalised. The fingerprint and replacement map never enter the archive or manifest.
+- Every source-aware CLI command requires fingerprints, reports, AI request/response files, previews, audits, human reviews, vaults, archives, and manifests to live outside the selected source tree.
 
 ## Sanctioned internal AI
 
@@ -36,11 +37,11 @@ The CLI does not call an AI provider. It writes bounded JSON artifacts so the pr
 ```bash
 python -m pip install -e .
 
-deidentify init fingerprint.json
+deidentify init /path/to/project fingerprint.json
 deidentify scan /path/to/project --report scan-report.json \
   --ai-review-request internal-ai-review.json
 # Submit only to sanctioned internal AI, then save its JSON response.
-deidentify import-review fingerprint.json internal-ai-response.json
+deidentify import-review /path/to/project fingerprint.json internal-ai-response.json
 # Human review: set vetted entries in fingerprint.json to "approved".
 
 deidentify preview /path/to/project fingerprint.json --output preview.json

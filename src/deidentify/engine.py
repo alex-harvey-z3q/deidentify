@@ -357,7 +357,7 @@ def build_plan(source: Path, fingerprint: dict[str, Any], unsupported_policy: st
         collision = next((existing for existing in destinations if target_name == existing or target_name.startswith(existing + "/") or existing.startswith(target_name + "/")), None)
         if collision: raise ValueError(f"Path collision after transformation: {destinations[collision]} and {relative} overlap at {target.as_posix()}")
         destinations[target_name] = relative.as_posix(); changed, content_applied, content_count = replace_text(text, replacements)
-        plan.append({"relative": relative, "target": target, "text": changed, "applied": path_applied | content_applied, "path_occurrences": path_count, "content_occurrences": content_count})
+        plan.append({"relative": relative, "target": target, "original_text": text, "text": changed, "applied": path_applied | content_applied, "path_occurrences": path_count, "content_occurrences": content_count})
     return plan, omitted, replacements
 
 
@@ -372,7 +372,7 @@ def short_variant_risks(fingerprint: dict[str, Any], plan: list[dict[str, Any]])
                 continue
             files = 0; occurrences = 0
             for item in plan:
-                count = len(re.findall(re.escape(variant), item["relative"].as_posix(), re.IGNORECASE)) + len(re.findall(re.escape(variant), item["text"], re.IGNORECASE))
+                count = len(re.findall(re.escape(variant), item["relative"].as_posix(), re.IGNORECASE)) + len(re.findall(re.escape(variant), item["original_text"], re.IGNORECASE))
                 if count:
                     files += 1; occurrences += count
             risks.append({"canonical": entry["canonical"], "variant": variant, "length": len(variant), "affected_files": files, "occurrences": occurrences, "acknowledged": isinstance(acknowledgements.get(variant), str) and bool(acknowledgements[variant].strip())})

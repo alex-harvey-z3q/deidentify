@@ -8,16 +8,28 @@ from pathlib import Path
 from .engine import ai_review_request, audit_request, audit_review_template, build, import_review, initial_fingerprint, load_json, preview, reidentify, require_outside_source, scan, validate_fingerprint, write_json
 
 
+def require_workflow_artifacts_outside_source(source: Path, **artifacts: Path | None) -> None:
+    for label, path in artifacts.items():
+        if path is None:
+            continue
+        try:
+            require_outside_source(source, path, label.replace("_", " ").capitalize())
+        except ValueError as exc:
+            raise ValueError(f"{label.replace('_', ' ')} must be outside the source repository:\nsource: {source.absolute()}\nartifact: {path.absolute()}") from exc
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="deidentify", description="Create reviewed deidentified text bundles locally.")
     commands = root.add_subparsers(dest="command", required=True)
     init = commands.add_parser("init", help="Create an empty organisation fingerprint JSON file.")
+    init.add_argument("source", type=Path, help="Source repository the fingerprint will govern; the fingerprint must be outside it.")
     init.add_argument("fingerprint", type=Path)
     scan_cmd = commands.add_parser("scan", help="Discover local candidate identifiers.")
     scan_cmd.add_argument("source", type=Path)
     scan_cmd.add_argument("--report", type=Path, required=True)
     scan_cmd.add_argument("--copilot-request", "--ai-review-request", dest="ai_review_request", type=Path, required=True)
     review = commands.add_parser("import-review", help="Import unapproved entries proposed by sanctioned internal AI.")
+    review.add_argument("source", type=Path)
     review.add_argument("fingerprint", type=Path)
     review.add_argument("review", type=Path)
     build_cmd = commands.add_parser("build", help="Build a fresh deidentified tarball from approved entries.")
@@ -56,32 +68,29 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
         if args.command == "init":
+            require_workflow_artifacts_outside_source(args.source, fingerprint=args.fingerprint)
             if args.fingerprint.exists():
                 raise ValueError(f"Refusing to overwrite existing file: {args.fingerprint}")
             write_json(args.fingerprint, initial_fingerprint())
             print(f"Created fingerprint: {args.fingerprint}")
         elif args.command == "scan":
-            report = scan(args.source)
+            require_workflow_artifacts_outside_source(args.source, scan_report=args.report, ai_review_request=args.ai_review_request)
+            report = scan(source=args.source)
             write_json(args.report, report)
             write_json(args.ai_review_request, ai_review_request(report))
             print(f"Scanned {report['source']['scanned_file_count']} text files; found {len(report['candidate_inventory'])} candidate groups.")
             print(f"Report: {args.report}")
             print(f"Internal-AI review request: {args.ai_review_request}")
         elif args.command == "import-review":
+            require_workflow_artifacts_outside_source(args.source, fingerprint=args.fingerprint, ai_review_response=args.review)
             fingerprint = load_json(args.fingerprint)
             review = load_json(args.review)
-            fingerprint, added, updated = import_review(fingerprint, review)
+            fingerprint, added, updated = import_review(fingerprint=fingerprint, review=review)
             write_json(args.fingerprint, fingerprint)
             print(f"Imported review: {added} candidate entries added, {updated} entries updated.")
             print("Review the fingerprint and explicitly set vetted entries to status: approved before building.")
         elif args.command == "build":
-            require_outside_source(args.source, args.fingerprint, "Fingerprint")
-            if args.audit_findings:
-                require_outside_source(args.source, args.audit_findings, "Audit findings")
-            if args.audit_review:
-                require_outside_source(args.source, args.audit_review, "Human audit review")
-            if args.mapping_vault:
-                require_outside_source(args.source, args.mapping_vault, "Mapping vault")
+            require_workflow_artifacts_outside_source(args.source, fingerprint=args.fingerprint, audit_findings=args.audit_findings, human_audit_review=args.audit_review, mapping_vault=args.mapping_vault, archive_output=args.output)
             fingerprint = load_json(args.fingerprint)
             validate_fingerprint(fingerprint)
             audit = load_json(args.audit_findings) if args.audit_findings else None
@@ -100,19 +109,22 @@ def main(argv: list[str] | None = None) -> int:
             if args.mapping_vault:
                 print(f"Encrypted mapping vault: {args.mapping_vault}")
         elif args.command == "preview":
+            require_workflow_artifacts_outside_source(args.source, fingerprint=args.fingerprint, preview_output=args.output)
             fingerprint = load_json(args.fingerprint)
-            write_json(args.output, preview(args.source, fingerprint, args.unsupported_policy))
+            write_json(args.output, preview(source=args.source, fingerprint=fingerprint, unsupported_policy=args.unsupported_policy))
             print(f"Preview: {args.output}")
         elif args.command == "audit-request":
+            require_workflow_artifacts_outside_source(args.source, fingerprint=args.fingerprint, audit_request=args.output)
             fingerprint = load_json(args.fingerprint)
-            write_json(args.output, audit_request(args.source, fingerprint, args.unsupported_policy))
+            write_json(args.output, audit_request(source=args.source, fingerprint=fingerprint, unsupported_policy=args.unsupported_policy))
             print(f"Adversarial internal-AI audit request: {args.output}")
         elif args.command == "audit-review-template":
+            require_workflow_artifacts_outside_source(args.source, fingerprint=args.fingerprint, audit_findings=args.audit_findings, human_audit_review=args.output)
             fingerprint = load_json(args.fingerprint)
-            write_json(args.output, audit_review_template(args.source, fingerprint, load_json(args.audit_findings), args.unsupported_policy))
+            write_json(args.output, audit_review_template(source=args.source, fingerprint=fingerprint, audit=load_json(args.audit_findings), unsupported_policy=args.unsupported_policy))
             print(f"Human audit-review template: {args.output}")
         elif args.command == "reidentify":
-            manifest = reidentify(args.returned_archive, args.mapping_vault, args.output, getpass.getpass("Mapping-vault passphrase: "))
+            manifest = reidentify(returned_archive=args.returned_archive, vault_path=args.mapping_vault, output=args.output, passphrase=getpass.getpass("Mapping-vault passphrase: "))
             print(f"Created reidentified archive: {args.output}")
             print(f"Manifest: {args.output.with_suffix(args.output.suffix + '.manifest.json')}")
             print(f"Restored {manifest['reidentified_token_occurrences']} token occurrences to canonical values.")
