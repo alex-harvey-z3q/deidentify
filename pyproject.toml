@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deidentify-bundle"
+version = "0.1.0"
+description = "Local-first deidentification workflow for text bundles and Git projects"
+requires-python = ">=3.11"
+
+[project.scripts]
+deidentify = "deidentify.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

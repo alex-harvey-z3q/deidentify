@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+*.tar.gz
+*.manifest.json
+scan-report.json
+copilot-request.json
