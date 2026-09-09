@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "deidentify-bundle"
-version = "0.2.1"
+version = "0.2.2"
 description = "Local-first deidentification workflow for text bundles and Git projects"
 requires-python = ">=3.11"
 dependencies = ["cryptography>=42"]

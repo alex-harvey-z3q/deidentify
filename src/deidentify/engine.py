@@ -20,7 +20,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 WINDOWS_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 DEFAULT_EXCLUDED_DIRS = {".git", ".hg", ".svn", "node_modules", "vendor", "dist", "build", ".venv", "venv", "__pycache__"}
 DEFAULT_EXCLUDED_FILE_NAMES = {".env", ".envrc", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"}
@@ -85,9 +85,6 @@ def validate_fingerprint(fingerprint: dict[str, Any]) -> list[dict[str, Any]]:
         variants = entry.get("variants")
         if not isinstance(variants, list) or not all(isinstance(v, str) and v.strip() for v in variants):
             raise ValueError(f"entries[{index}].variants must be non-empty strings")
-        acknowledgements = entry.get("short_variant_acknowledgements", {})
-        if not isinstance(acknowledgements, dict) or not all(isinstance(k, str) and isinstance(v, str) and v.strip() for k, v in acknowledgements.items()):
-            raise ValueError(f"entries[{index}].short_variant_acknowledgements must map variants to non-empty reasons")
         key = entry["canonical"].casefold()
         if key in seen:
             raise ValueError(f"Duplicate canonical entry: {entry['canonical']}")
@@ -250,10 +247,10 @@ def ai_review_request(report: dict[str, Any]) -> dict[str, Any]:
     return {"schema_version": 1, "purpose": "Internal-only organisation fingerprint discovery; proposals remain candidates and cannot approve replacements.", "instructions": "Review the bounded snippets and candidate inventory. Discover employer/company, customer, project/program, internal product/system, hostname/domain, repository organisation, cloud tenant/account, alias, acronym, or meaningful identifier that could fingerprint the source. Return only response_schema JSON. Do not transform content, approve entries, or invent evidence.", "candidate_inventory": report["candidate_inventory"], "semantic_chunks": report["semantic_chunks"], "response_schema": {"entries": [{"canonical": "string", "category": "company|internal_product|customer|internal_system|project|other", "variants": ["string"], "confidence": "low|medium|high", "rationale": "string", "evidence": [{"path": "string", "line": 1}]}]}}
 
 
-def import_review(fingerprint: dict[str, Any], review: dict[str, Any]) -> tuple[dict[str, Any], int, int]:
+def import_review(fingerprint: dict[str, Any], review: dict[str, Any], approve_all: bool = False) -> tuple[dict[str, Any], int, int, int]:
     entries = review.get("entries")
     if not isinstance(entries, list): raise ValueError("review.entries must be a list")
-    current = validate_fingerprint(fingerprint); by_name = {entry["canonical"].casefold(): entry for entry in current}; added = updated = 0
+    current = validate_fingerprint(fingerprint); by_name = {entry["canonical"].casefold(): entry for entry in current}; added = updated = approved = 0
     for index, proposal in enumerate(entries):
         if not isinstance(proposal, dict): raise ValueError(f"review.entries[{index}] must be an object")
         canonical, category, variants, confidence = proposal.get("canonical"), proposal.get("category"), proposal.get("variants"), proposal.get("confidence", "medium")
@@ -263,8 +260,19 @@ def import_review(fingerprint: dict[str, Any], review: dict[str, Any]) -> tuple[
             target = by_name[key]; target["variants"] = sorted(set(target["variants"]) | set(variants) | {canonical.strip()}, key=str.casefold); target.setdefault("evidence", []).extend(proposal.get("evidence", []) if isinstance(proposal.get("evidence", []), list) else []); target.setdefault("rationales", []).append(str(proposal.get("rationale", ""))); target["last_seen"] = utc_now(); updated += 1
         else:
             target = {"canonical": canonical.strip(), "category": category, "variants": sorted(set(variants) | {canonical.strip()}, key=str.casefold), "status": "candidate", "confidence": confidence, "rationales": [str(proposal.get("rationale", ""))], "evidence": proposal.get("evidence", []) if isinstance(proposal.get("evidence", []), list) else [], "first_seen": utc_now(), "last_seen": utc_now()}; current.append(target); by_name[key] = target; added += 1
+        if approve_all and target["status"] != "approved":
+            target["status"] = "approved"; approved += 1
     fingerprint["entries"] = sorted(current, key=lambda item: item["canonical"].casefold()); fingerprint["updated_at"] = utc_now(); validate_fingerprint(fingerprint)
-    return fingerprint, added, updated
+    return fingerprint, added, updated, approved
+
+
+def approve_candidates(fingerprint: dict[str, Any]) -> tuple[dict[str, Any], int]:
+    entries = validate_fingerprint(fingerprint); count = 0
+    for entry in entries:
+        if entry["status"] == "candidate":
+            entry["status"] = "approved"; count += 1
+    fingerprint["updated_at"] = utc_now()
+    return fingerprint, count
 
 
 def approved_replacements(fingerprint: dict[str, Any]) -> list[tuple[str, str, str]]:
@@ -366,7 +374,6 @@ def short_variant_risks(fingerprint: dict[str, Any], plan: list[dict[str, Any]])
     for entry in validate_fingerprint(fingerprint):
         if entry["status"] != "approved":
             continue
-        acknowledgements = entry.get("short_variant_acknowledgements", {})
         for variant in entry["variants"]:
             if len(variant) >= 4:
                 continue
@@ -375,7 +382,7 @@ def short_variant_risks(fingerprint: dict[str, Any], plan: list[dict[str, Any]])
                 count = len(re.findall(re.escape(variant), item["relative"].as_posix(), re.IGNORECASE)) + len(re.findall(re.escape(variant), item["original_text"], re.IGNORECASE))
                 if count:
                     files += 1; occurrences += count
-            risks.append({"canonical": entry["canonical"], "variant": variant, "length": len(variant), "affected_files": files, "occurrences": occurrences, "acknowledged": isinstance(acknowledgements.get(variant), str) and bool(acknowledgements[variant].strip())})
+            risks.append({"canonical": entry["canonical"], "variant": variant, "length": len(variant), "affected_files": files, "occurrences": occurrences})
     return risks
 
 
@@ -469,8 +476,7 @@ def build(source: Path, fingerprint: dict[str, Any], output: Path, unsupported_p
     if output.exists() or output.with_suffix(output.suffix + ".manifest.json").exists():
         raise ValueError("Refusing to overwrite an existing archive or manifest")
     plan, omitted, replacements = build_plan(source, fingerprint, unsupported_policy)
-    short_risks = short_variant_risks(fingerprint, plan); unacknowledged = [risk for risk in short_risks if not risk["acknowledged"]]
-    if unacknowledged: raise ValueError(f"Approved variants shorter than 4 characters require per-entry human acknowledgement: {', '.join(repr(risk['variant']) for risk in unacknowledged)}")
+    short_risks = short_variant_risks(fingerprint, plan)
     audit_request_for_build = audit_request(source, fingerprint, unsupported_policy) if audit is not None else None
     substantive = substantive_audit_findings(audit, audit_request_for_build, audit_review) if audit is not None and audit_request_for_build else []
     if fail_on_ai_findings and substantive: raise ValueError(f"Adversarial AI audit has {len(substantive)} open medium/high findings; archive blocked")

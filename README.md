@@ -44,6 +44,11 @@ deidentify scan /path/to/project --report scan-report.json \
 deidentify import-review /path/to/project fingerprint.json internal-ai-response.json
 # Human review: set vetted entries in fingerprint.json to "approved".
 
+# Optional convenience workflow: explicitly approve only entries in this import.
+deidentify import-review /path/to/project fingerprint.json internal-ai-response.json --approve-all
+# Or explicitly approve every candidate already in the reviewed fingerprint.
+deidentify approve /path/to/project fingerprint.json --all
+
 deidentify preview /path/to/project fingerprint.json --output preview.json
 deidentify audit-request /path/to/project fingerprint.json --output audit-request.json
 # Submit audit-request.json to sanctioned internal AI and save its response.
@@ -84,6 +89,8 @@ Fingerprint states are:
 
 Keep the fingerprint outside the source tree where possible and protect it as sensitive organisational data.
 
+`import-review --approve-all` is an explicit user decision to accept all candidates touched by that AI review. It never honours an AI-provided status field on its own, and it does not change unrelated existing candidates. `approve --all` is the separate explicit action for all current candidates in a fingerprint.
+
 ## Audit binding and AI response formats
 
 Discovery responses are JSON with `entries`. Each entry needs `canonical`, `category`, `variants`, `confidence` (`low`, `medium`, or `high`), `rationale`, and `evidence` with path/line where available.
@@ -102,7 +109,7 @@ Only recognised UTF-8 text files are transformed. Unknown extensions, binaries, 
 
 Build uses longer variants first, case-insensitively, for contents and every path component. It independently scans staged paths and text after transformation; any residual approved variant blocks export. Path validation and collision checks use Windows-compatible semantics, including case folding and trailing dot/space handling.
 
-Approved variants shorter than four characters are shown in preview with their affected-file and occurrence counts. A build requires a per-entry `short_variant_acknowledgements` reason for each such variant; there is no broad command-line bypass.
+Approved variants shorter than four characters are shown in preview with their affected-file and occurrence counts. They are transformed like every other approved variant; use this information to assess the impact of intentionally broad replacements.
 
 ## License
 

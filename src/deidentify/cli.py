@@ -5,7 +5,7 @@ import getpass
 import sys
 from pathlib import Path
 
-from .engine import ai_review_request, audit_request, audit_review_template, build, import_review, initial_fingerprint, load_json, preview, reidentify, require_outside_source, scan, validate_fingerprint, write_json
+from .engine import ai_review_request, approve_candidates, audit_request, audit_review_template, build, import_review, initial_fingerprint, load_json, preview, reidentify, require_outside_source, scan, validate_fingerprint, write_json
 
 
 def require_workflow_artifacts_outside_source(source: Path, **artifacts: Path | None) -> None:
@@ -32,6 +32,11 @@ def parser() -> argparse.ArgumentParser:
     review.add_argument("source", type=Path)
     review.add_argument("fingerprint", type=Path)
     review.add_argument("review", type=Path)
+    review.add_argument("--approve-all", action="store_true", help="Explicitly approve only entries imported or updated by this operation.")
+    approve_cmd = commands.add_parser("approve", help="Explicitly approve all current candidate entries in a fingerprint.")
+    approve_cmd.add_argument("source", type=Path)
+    approve_cmd.add_argument("fingerprint", type=Path)
+    approve_cmd.add_argument("--all", action="store_true", required=True, help="Approve every current candidate entry.")
     build_cmd = commands.add_parser("build", help="Build a fresh deidentified tarball from approved entries.")
     build_cmd.add_argument("source", type=Path)
     build_cmd.add_argument("fingerprint", type=Path)
@@ -85,10 +90,18 @@ def main(argv: list[str] | None = None) -> int:
             require_workflow_artifacts_outside_source(args.source, fingerprint=args.fingerprint, ai_review_response=args.review)
             fingerprint = load_json(args.fingerprint)
             review = load_json(args.review)
-            fingerprint, added, updated = import_review(fingerprint=fingerprint, review=review)
+            fingerprint, added, updated, approved = import_review(fingerprint=fingerprint, review=review, approve_all=args.approve_all)
             write_json(args.fingerprint, fingerprint)
             print(f"Imported review: {added} candidate entries added, {updated} entries updated.")
-            print("Review the fingerprint and explicitly set vetted entries to status: approved before building.")
+            if args.approve_all:
+                print(f"Approved {approved} imported entries.")
+            else:
+                print("Review the fingerprint and explicitly set vetted entries to status: approved before building.")
+        elif args.command == "approve":
+            require_workflow_artifacts_outside_source(args.source, fingerprint=args.fingerprint)
+            fingerprint, approved = approve_candidates(fingerprint=load_json(args.fingerprint))
+            write_json(args.fingerprint, fingerprint)
+            print(f"Approved {approved} candidate entries.")
         elif args.command == "build":
             require_workflow_artifacts_outside_source(args.source, fingerprint=args.fingerprint, audit_findings=args.audit_findings, human_audit_review=args.audit_review, mapping_vault=args.mapping_vault, archive_output=args.output)
             fingerprint = load_json(args.fingerprint)

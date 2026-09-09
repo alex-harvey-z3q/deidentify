@@ -67,3 +67,26 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(2, result.returncode, result.stdout)
                 self.assertIn("outside the source repository", result.stderr)
             self.assertFalse((source / "report.json").exists())
+
+    def test_actual_cli_explicit_candidate_approval_workflows(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); source = root / "source"; source.mkdir()
+            fingerprint_path = root / "fingerprint.json"
+            fingerprint_path.write_text(json.dumps({"schema_version": 1, "entries": [
+                {"canonical": "Existing", "category": "project", "variants": ["Existing"], "status": "candidate"},
+                {"canonical": "Already", "category": "project", "variants": ["Already"], "status": "approved"},
+            ]}), encoding="utf-8")
+            review_path = root / "review.json"
+            review_path.write_text(json.dumps({"entries": [{"canonical": "Orion", "category": "project", "variants": ["Orion"], "status": "approved", "confidence": "high", "rationale": "AI status must not decide", "evidence": []}]}), encoding="utf-8")
+            normal = self.run_cli("import-review", str(source), str(fingerprint_path), str(review_path))
+            self.assertEqual(0, normal.returncode, normal.stderr)
+            statuses = {entry["canonical"]: entry["status"] for entry in json.loads(fingerprint_path.read_text())["entries"]}
+            self.assertEqual("candidate", statuses["Orion"])
+            approved = self.run_cli("import-review", str(source), str(fingerprint_path), str(review_path), "--approve-all")
+            self.assertEqual(0, approved.returncode, approved.stderr); self.assertIn("Approved 1 imported entries", approved.stdout)
+            statuses = {entry["canonical"]: entry["status"] for entry in json.loads(fingerprint_path.read_text())["entries"]}
+            self.assertEqual("approved", statuses["Orion"]); self.assertEqual("candidate", statuses["Existing"]); self.assertEqual("approved", statuses["Already"])
+            all_candidates = self.run_cli("approve", str(source), str(fingerprint_path), "--all")
+            self.assertEqual(0, all_candidates.returncode, all_candidates.stderr); self.assertIn("Approved 1 candidate entries", all_candidates.stdout)
+            statuses = {entry["canonical"]: entry["status"] for entry in json.loads(fingerprint_path.read_text())["entries"]}
+            self.assertEqual("approved", statuses["Existing"])

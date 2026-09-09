@@ -131,7 +131,7 @@ class EngineTests(unittest.TestCase):
             request = ai_review_request(scan(root))
             self.assertLessEqual(len(request["semantic_chunks"]), 200)
             self.assertIn("cannot approve", request["purpose"])
-            fingerprint, added, _ = import_review(initial_fingerprint(), {"entries": [{"canonical": "ProjectOrion", "category": "project", "variants": ["ProjectOrion"], "status": "approved", "confidence": "high", "rationale": "test", "evidence": []}]})
+            fingerprint, added, _, _ = import_review(initial_fingerprint(), {"entries": [{"canonical": "ProjectOrion", "category": "project", "variants": ["ProjectOrion"], "status": "approved", "confidence": "high", "rationale": "test", "evidence": []}]})
             self.assertEqual(1, added); self.assertEqual("candidate", fingerprint["entries"][0]["status"])
 
     def test_static_discovery_covers_cloud_network_and_identifier_signals(self):
@@ -251,7 +251,7 @@ class EngineTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "malformed"):
                 build(root, fingerprint, parent / "bad-review.tar.gz", audit=audit, audit_review=bad_review, fail_on_ai_findings=True)
 
-    def test_portable_tokens_and_short_variant_acknowledgement(self):
+    def test_portable_tokens_and_short_variants_transform_normally(self):
         with tempfile.TemporaryDirectory() as name:
             parent = Path(name); root = self.source(parent); (root / "AD.yml").write_text("AD AD", encoding="utf-8")
             (root / "dirAD").mkdir(); (root / "dirAD" / "other.yml").write_text("aD", encoding="utf-8")
@@ -261,13 +261,10 @@ class EngineTests(unittest.TestCase):
             self.assertNotIn(token.upper(), {"CON", "PRN", "AUX", "NUL"})
             preview_data = preview(root, fingerprint)
             self.assertEqual(2, preview_data["short_variant_risks"][0]["length"])
-            self.assertFalse(preview_data["short_variant_risks"][0]["acknowledged"])
             self.assertEqual(2, preview_data["short_variant_risks"][0]["affected_files"])
             self.assertEqual(5, preview_data["short_variant_risks"][0]["occurrences"])
-            with self.assertRaisesRegex(ValueError, "shorter than 4"):
-                build(root, fingerprint, parent / "blocked.tar.gz")
-            fingerprint["entries"][0]["short_variant_acknowledgements"] = {"AD": "Approved by release reviewer; this acronym must be removed."}
             build(root, fingerprint, parent / "allowed.tar.gz")
+            self.assertNotIn("AD", self.archive_text(parent / "allowed.tar.gz", "__PROJECT_001__.yml"))
 
     def test_portable_path_collisions_are_case_insensitive(self):
         # The host filesystem may itself be case-insensitive, so test the portable collision key directly.
