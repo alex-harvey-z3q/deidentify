@@ -20,7 +20,8 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
+WINDOWS_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 DEFAULT_EXCLUDED_DIRS = {".git", ".hg", ".svn", "node_modules", "vendor", "dist", "build", ".venv", "venv", "__pycache__"}
 DEFAULT_EXCLUDED_FILE_NAMES = {".env", ".envrc", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"}
 GENERIC_PATH_COMPONENTS = {"src", "test", "tests", "docs", "doc", "main", "config", "configs", "assets", "scripts", "lib", "app", "api", "service", "services", "terraform"}
@@ -84,6 +85,9 @@ def validate_fingerprint(fingerprint: dict[str, Any]) -> list[dict[str, Any]]:
         variants = entry.get("variants")
         if not isinstance(variants, list) or not all(isinstance(v, str) and v.strip() for v in variants):
             raise ValueError(f"entries[{index}].variants must be non-empty strings")
+        acknowledgements = entry.get("short_variant_acknowledgements", {})
+        if not isinstance(acknowledgements, dict) or not all(isinstance(k, str) and isinstance(v, str) and v.strip() for k, v in acknowledgements.items()):
+            raise ValueError(f"entries[{index}].short_variant_acknowledgements must map variants to non-empty reasons")
         key = entry["canonical"].casefold()
         if key in seen:
             raise ValueError(f"Duplicate canonical entry: {entry['canonical']}")
@@ -266,12 +270,12 @@ def import_review(fingerprint: dict[str, Any], review: dict[str, Any]) -> tuple[
 def approved_replacements(fingerprint: dict[str, Any]) -> list[tuple[str, str, str]]:
     counters: Counter[str] = Counter(); replacements = []
     for entry in sorted((e for e in validate_fingerprint(fingerprint) if e["status"] == "approved"), key=lambda e: (e["category"], e["canonical"].casefold())):
-        counters[entry["category"]] += 1; token = f"<{entry['category'].upper()}_{counters[entry['category']]:03d}>"
+        counters[entry["category"]] += 1; token = f"__{entry['category'].upper()}_{counters[entry['category']]:03d}__"
         replacements.extend((variant, token, entry["canonical"]) for variant in entry["variants"])
     return sorted(replacements, key=lambda item: len(item[0]), reverse=True)
 
 
-def mapping_vault(fingerprint: dict[str, Any], passphrase: str) -> dict[str, Any]:
+def mapping_vault(fingerprint: dict[str, Any], passphrase: str, release_tree_digest: str | None = None) -> dict[str, Any]:
     if not passphrase:
         raise ValueError("Mapping-vault passphrase must not be empty")
     token_map: dict[str, str] = {}
@@ -281,14 +285,14 @@ def mapping_vault(fingerprint: dict[str, Any], passphrase: str) -> dict[str, Any
         raise ValueError("No approved mappings available for a vault")
     salt = os.urandom(16)
     key = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=600_000).derive(passphrase.encode("utf-8"))
-    plaintext = json.dumps({"schema_version": 1, "token_map": token_map}, sort_keys=True).encode("utf-8")
+    plaintext = json.dumps({"schema_version": 1, "token_map": token_map, "release_tree_digest": release_tree_digest}, sort_keys=True).encode("utf-8")
     return {"schema_version": 1, "kdf": {"name": "PBKDF2-HMAC-SHA256", "iterations": 600_000, "salt": urlsafe_b64encode(salt).decode("ascii")}, "ciphertext": Fernet(urlsafe_b64encode(key)).encrypt(plaintext).decode("ascii")}
 
 
-def write_mapping_vault(path: Path, fingerprint: dict[str, Any], passphrase: str) -> None:
+def write_mapping_vault(path: Path, fingerprint: dict[str, Any], passphrase: str, release_tree_digest: str | None = None) -> None:
     if path.exists():
         raise ValueError(f"Refusing to overwrite existing mapping vault: {path}")
-    write_json(path, mapping_vault(fingerprint, passphrase))
+    write_json(path, mapping_vault(fingerprint, passphrase, release_tree_digest))
 
 
 def decrypt_mapping_vault(path: Path, passphrase: str) -> dict[str, str]:
@@ -319,11 +323,23 @@ def transformed_relative(relative: Path, replacements: list[tuple[str, str, str]
     parts = []; applied: set[str] = set(); count = 0
     for component in relative.parts:
         value, names, occurrences = replace_text(component, replacements)
-        if not value or value in {".", ".."} or "/" in value or "\\" in value or "\x00" in value: raise ValueError(f"Unsafe transformed path component from {relative}")
+        reserved = value.rstrip(". ").split(".", 1)[0].upper() in WINDOWS_RESERVED_NAMES
+        if not value or value in {".", ".."} or value != value.rstrip(". ") or "/" in value or "\\" in value or "\x00" in value or reserved: raise ValueError(f"Unsafe transformed path component from {relative}")
         parts.append(value); applied.update(names); count += occurrences
     target = Path(*parts)
     if target.is_absolute() or any(part in {".", ".."} for part in target.parts): raise ValueError(f"Unsafe transformed path: {relative}")
     return target, applied, count
+
+
+def portable_path_key(path: Path) -> str:
+    """Windows-compatible key used only to prevent cross-platform archive collisions."""
+    return "/".join(part.rstrip(". ").casefold() for part in path.parts)
+
+
+def tree_digest(plan: list[dict[str, Any]]) -> str:
+    entries = [{"path": item["target"].as_posix(), "content_sha256": hashlib.sha256(item["text"].encode("utf-8")).hexdigest(), "size": len(item["text"].encode("utf-8")), "type": "regular-file"} for item in sorted(plan, key=lambda item: item["target"].as_posix())]
+    encoded = json.dumps(entries, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 def build_plan(source: Path, fingerprint: dict[str, Any], unsupported_policy: str = "reject") -> tuple[list[dict[str, Any]], list[dict[str, str]], list[tuple[str, str, str]]]:
@@ -337,49 +353,128 @@ def build_plan(source: Path, fingerprint: dict[str, Any], unsupported_policy: st
         if reason:
             if unsupported_policy == "reject": raise ValueError(f"Refusing incomplete export: {relative}: {reason}")
             omitted.append({"path": relative.as_posix(), "reason": f"policy: excluded unsupported file ({reason})"}); continue
-        target, path_applied, path_count = transformed_relative(relative, replacements); target_name = target.as_posix()
+        target, path_applied, path_count = transformed_relative(relative, replacements); target_name = portable_path_key(target)
         collision = next((existing for existing in destinations if target_name == existing or target_name.startswith(existing + "/") or existing.startswith(target_name + "/")), None)
-        if collision: raise ValueError(f"Path collision after transformation: {destinations[collision]} and {relative} overlap at {target_name}")
+        if collision: raise ValueError(f"Path collision after transformation: {destinations[collision]} and {relative} overlap at {target.as_posix()}")
         destinations[target_name] = relative.as_posix(); changed, content_applied, content_count = replace_text(text, replacements)
         plan.append({"relative": relative, "target": target, "text": changed, "applied": path_applied | content_applied, "path_occurrences": path_count, "content_occurrences": content_count})
     return plan, omitted, replacements
 
 
+def short_variant_risks(fingerprint: dict[str, Any], plan: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    risks = []
+    for entry in validate_fingerprint(fingerprint):
+        if entry["status"] != "approved":
+            continue
+        acknowledgements = entry.get("short_variant_acknowledgements", {})
+        for variant in entry["variants"]:
+            if len(variant) >= 4:
+                continue
+            files = 0; occurrences = 0
+            for item in plan:
+                count = len(re.findall(re.escape(variant), item["relative"].as_posix(), re.IGNORECASE)) + len(re.findall(re.escape(variant), item["text"], re.IGNORECASE))
+                if count:
+                    files += 1; occurrences += count
+            risks.append({"canonical": entry["canonical"], "variant": variant, "length": len(variant), "affected_files": files, "occurrences": occurrences, "acknowledged": isinstance(acknowledgements.get(variant), str) and bool(acknowledgements[variant].strip())})
+    return risks
+
+
 def preview(source: Path, fingerprint: dict[str, Any], unsupported_policy: str = "reject") -> dict[str, Any]:
     plan, omitted, _ = build_plan(source, fingerprint, unsupported_policy)
     changes = [{"source_path": item["relative"].as_posix(), "output_path": item["target"].as_posix(), "path_changed": item["relative"] != item["target"], "content_changed": bool(item["content_occurrences"]), "occurrences": item["path_occurrences"] + item["content_occurrences"], "fingerprint_entries": sorted(item["applied"])} for item in plan if item["path_occurrences"] or item["content_occurrences"]]
-    return {"schema_version": 1, "created_at": utc_now(), "changes": changes, "omitted_files": omitted, "output_file_count": len(plan)}
+    return {"schema_version": 2, "created_at": utc_now(), "tree_digest": tree_digest(plan), "changes": changes, "short_variant_risks": short_variant_risks(fingerprint, plan), "omitted_files": omitted, "output_file_count": len(plan)}
 
 
 def remaining_approved(text: str, replacements: list[tuple[str, str, str]]) -> set[str]:
     return {canonical for variant, _, canonical in replacements if re.search(re.escape(variant), text, re.IGNORECASE)}
 
 
+AUDIT_CHUNKS_PER_BATCH = 25
+HIGH_RISK_EXTENSIONS = {".md", ".tf", ".yml", ".yaml", ".json", ".sh", ".ps1", ".toml", ".ini", ".conf"}
+
+
+def digest_json(value: Any) -> str:
+    return "sha256:" + hashlib.sha256(json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def audit_chunks(plan: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    chunks = []
+    for item in plan:
+        lines = item["text"].splitlines(); relative = item["target"]
+        candidates = extract_candidates(item["text"], relative, "content") + path_candidates(relative)
+        starts = {1, max(1, len(lines) - 39)}
+        starts.update(max(1, candidate["line"] - 3) for candidate in candidates if "line" in candidate)
+        risk = 0 if relative.suffix.lower() in HIGH_RISK_EXTENSIONS or relative.name.casefold().startswith(("readme", "docker", "compose")) else 1
+        for start in sorted(starts)[:6]:
+            chunks.append({"path": relative.as_posix(), "start_line": start, "end_line": min(len(lines), start + 39), "text": "\n".join(lines[start - 1:start + 39]), "risk": risk, "signal_count": len(candidates)})
+    return sorted(chunks, key=lambda item: (item["risk"], -item["signal_count"], item["path"], item["start_line"]))
+
+
 def audit_request(source: Path, fingerprint: dict[str, Any], unsupported_policy: str = "reject") -> dict[str, Any]:
-    plan, _, _ = build_plan(source, fingerprint, unsupported_policy)
-    chunks = [{"path": item["target"].as_posix(), "start_line": 1, "end_line": min(len(item["text"].splitlines()), 80), "text": "\n".join(item["text"].splitlines()[:80])} for item in plan[:200]]
-    return {"schema_version": 1, "purpose": "Adversarial post-transformation audit only; do not transform files or approve mappings.", "instructions": "Examine this deidentified repository as an adversarial reviewer. Identify clues that could reveal the original organisation, customer, project, programme, environment, or internal system. Return only response_schema JSON.", "semantic_chunks": chunks, "response_schema": {"findings": [{"clue": "string", "category": "string", "path": "string", "line": 1, "explanation": "string", "confidence": "low|medium|high", "status": "open|dismissed"}]}}
+    plan, _, _ = build_plan(source, fingerprint, unsupported_policy); digest = tree_digest(plan); chunks = audit_chunks(plan)
+    batches = []
+    for offset in range(0, len(chunks), AUDIT_CHUNKS_PER_BATCH):
+        content = [{key: value for key, value in item.items() if key not in {"risk", "signal_count"}} for item in chunks[offset:offset + AUDIT_CHUNKS_PER_BATCH]]
+        batch_id = f"audit-{offset // AUDIT_CHUNKS_PER_BATCH + 1:03d}"
+        batches.append({"batch_id": batch_id, "batch_digest": digest_json(content), "semantic_chunks": content})
+    return {"schema_version": 2, "tree_digest": digest, "purpose": "Adversarial post-transformation audit only; AI cannot approve or dismiss findings.", "instructions": "Examine every supplied batch as an adversarial reviewer. Identify clues that could reveal the original organisation, customer, project, programme, environment, or internal system. Return one response batch per request batch, echoing tree_digest, batch_id, and batch_digest. Do not add a status field.", "batches": batches, "response_schema": {"tree_digest": "sha256:<hex>", "batches": [{"batch_id": "string", "batch_digest": "sha256:<hex>", "findings": [{"clue": "string", "category": "string", "path": "string", "line": 1, "explanation": "string", "confidence": "low|medium|high"}]}]}}
 
 
-def substantive_audit_findings(audit: dict[str, Any]) -> list[dict[str, Any]]:
-    findings = audit.get("findings")
-    if not isinstance(findings, list): raise ValueError("audit.findings must be a list")
-    result = []
-    for index, finding in enumerate(findings):
-        if not isinstance(finding, dict) or not isinstance(finding.get("clue"), str) or finding.get("confidence") not in {"low", "medium", "high"} or finding.get("status", "open") not in {"open", "dismissed"}: raise ValueError(f"audit.findings[{index}] is invalid")
-        if finding.get("status", "open") == "open" and finding["confidence"] in {"medium", "high"}: result.append(finding)
-    return result
+def finding_id(finding: dict[str, Any]) -> str:
+    fields = {key: finding.get(key) for key in ("clue", "category", "path", "line", "explanation", "confidence")}
+    return "finding:" + hashlib.sha256(json.dumps(fields, separators=(",", ":"), sort_keys=True).encode("utf-8")).hexdigest()
 
 
-def build(source: Path, fingerprint: dict[str, Any], output: Path, unsupported_policy: str = "reject", audit: dict[str, Any] | None = None, fail_on_ai_findings: bool = False, vault_path: Path | None = None, vault_passphrase: str | None = None) -> dict[str, Any]:
+def normalise_audit_response(response: dict[str, Any], request: dict[str, Any]) -> list[dict[str, Any]]:
+    expected_digest = request["tree_digest"]; received_digest = response.get("tree_digest")
+    if not isinstance(received_digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", received_digest) or received_digest != expected_digest:
+        raise ValueError(f"Audit findings do not apply to the current proposed release: expected {expected_digest}; received {received_digest!r}. Regenerate the audit request and review the current transformed tree.")
+    batches = response.get("batches")
+    if not isinstance(batches, list): raise ValueError("audit.batches must be a list")
+    expected = {batch["batch_id"]: batch["batch_digest"] for batch in request["batches"]}; received = {batch.get("batch_id"): batch for batch in batches if isinstance(batch, dict)}
+    if len(received) != len(batches) or set(received) != set(expected): raise ValueError("Audit response is missing, duplicates, or has unexpected required batches")
+    findings = []
+    for batch_id, digest in expected.items():
+        batch = received[batch_id]
+        if batch.get("batch_digest") != digest or not isinstance(batch.get("findings"), list): raise ValueError(f"Audit response batch {batch_id} is invalid or does not match its request")
+        for index, finding in enumerate(batch["findings"]):
+            if not isinstance(finding, dict) or not all(isinstance(finding.get(key), str) and finding[key].strip() for key in ("clue", "category", "path", "explanation")) or not isinstance(finding.get("line"), int) or finding["line"] < 1 or finding.get("confidence") not in {"low", "medium", "high"}:
+                raise ValueError(f"audit batch {batch_id} finding {index} is invalid")
+            normalised = {key: finding[key] for key in ("clue", "category", "path", "line", "explanation", "confidence")}
+            normalised["finding_id"] = finding_id(normalised); normalised["status"] = "open"  # AI status is deliberately ignored.
+            findings.append(normalised)
+    return findings
+
+
+def audit_review_template(source: Path, fingerprint: dict[str, Any], audit: dict[str, Any], unsupported_policy: str = "reject") -> dict[str, Any]:
+    request = audit_request(source, fingerprint, unsupported_policy); findings = normalise_audit_response(audit, request)
+    return {"schema_version": 1, "tree_digest": request["tree_digest"], "findings": findings, "dismissals": []}
+
+
+def substantive_audit_findings(response: dict[str, Any], request: dict[str, Any], review: dict[str, Any] | None) -> list[dict[str, Any]]:
+    findings = normalise_audit_response(response, request); dismissed: set[str] = set()
+    if review is not None:
+        if review.get("tree_digest") != request["tree_digest"] or not isinstance(review.get("dismissals"), list): raise ValueError("Human audit review does not apply to the current proposed release")
+        known = {finding["finding_id"]: finding for finding in findings}
+        for index, dismissal in enumerate(review["dismissals"]):
+            if not isinstance(dismissal, dict) or dismissal.get("status") != "dismissed" or not isinstance(dismissal.get("finding_id"), str) or dismissal["finding_id"] not in known or not isinstance(dismissal.get("reason"), str) or not dismissal["reason"].strip(): raise ValueError(f"human audit dismissal {index} is malformed")
+            dismissed.add(dismissal["finding_id"])
+    return [finding for finding in findings if finding["confidence"] in {"medium", "high"} and finding["finding_id"] not in dismissed]
+
+
+def build(source: Path, fingerprint: dict[str, Any], output: Path, unsupported_policy: str = "reject", audit: dict[str, Any] | None = None, audit_review: dict[str, Any] | None = None, fail_on_ai_findings: bool = False, vault_path: Path | None = None, vault_passphrase: str | None = None) -> dict[str, Any]:
     if fail_on_ai_findings and audit is None: raise ValueError("--fail-on-ai-findings requires an audit findings file")
     if (vault_path is None) != (vault_passphrase is None): raise ValueError("A mapping vault path and passphrase must be supplied together")
-    substantive = substantive_audit_findings(audit) if audit is not None else []
-    if fail_on_ai_findings and substantive: raise ValueError(f"Adversarial AI audit has {len(substantive)} open medium/high findings; archive blocked")
     require_outside_source(source, output, "Archive output")
     if output.exists() or output.with_suffix(output.suffix + ".manifest.json").exists():
         raise ValueError("Refusing to overwrite an existing archive or manifest")
-    plan, omitted, replacements = build_plan(source, fingerprint, unsupported_policy); output = output.absolute(); output.parent.mkdir(parents=True, exist_ok=True); final_occurrences = []
+    plan, omitted, replacements = build_plan(source, fingerprint, unsupported_policy)
+    short_risks = short_variant_risks(fingerprint, plan); unacknowledged = [risk for risk in short_risks if not risk["acknowledged"]]
+    if unacknowledged: raise ValueError(f"Approved variants shorter than 4 characters require per-entry human acknowledgement: {', '.join(repr(risk['variant']) for risk in unacknowledged)}")
+    audit_request_for_build = audit_request(source, fingerprint, unsupported_policy) if audit is not None else None
+    substantive = substantive_audit_findings(audit, audit_request_for_build, audit_review) if audit is not None and audit_request_for_build else []
+    if fail_on_ai_findings and substantive: raise ValueError(f"Adversarial AI audit has {len(substantive)} open medium/high findings; archive blocked")
+    release_digest = tree_digest(plan); output = output.absolute(); output.parent.mkdir(parents=True, exist_ok=True); final_occurrences = []
     with tempfile.TemporaryDirectory(prefix="deidentify-") as staging_name:
         staging = Path(staging_name)
         for item in plan:
@@ -394,10 +489,10 @@ def build(source: Path, fingerprint: dict[str, Any], output: Path, unsupported_p
                 destination = staging / item["target"]; info = archive.gettarinfo(str(destination), arcname=item["target"].as_posix()); info.uid = info.gid = 0; info.uname = info.gname = ""; info.mtime = 0
                 with destination.open("rb") as stream: archive.addfile(info, stream)
     checksum = hashlib.sha256(output.read_bytes()).hexdigest()
-    manifest = {"schema_version": 2, "tool_version": VERSION, "created_at": utc_now(), "archive": {"filename": output.name, "sha256": checksum, "file_count": len(plan), "metadata_normalised": True}, "fingerprint": {"approved_entry_count": sum(e["status"] == "approved" for e in fingerprint["entries"]), "entries_applied": len({name for item in plan for name in item["applied"]})}, "omitted_files": omitted, "final_check": {"passed": True, "unresolved_approved_variants": 0, "paths_checked": True}, "ai_audit": {"performed": audit is not None, "open_medium_or_high_findings": len(substantive)}, "notes": ["No original-to-replacement map is stored in this manifest."]}
+    manifest = {"schema_version": 3, "tool_version": VERSION, "created_at": utc_now(), "tree_digest": release_digest, "archive": {"filename": output.name, "sha256": checksum, "file_count": len(plan), "metadata_normalised": True}, "fingerprint": {"approved_entry_count": sum(e["status"] == "approved" for e in fingerprint["entries"]), "entries_applied": len({name for item in plan for name in item["applied"]})}, "short_variant_risks": short_risks, "omitted_files": omitted, "final_check": {"passed": True, "unresolved_approved_variants": 0, "paths_checked": True}, "ai_audit": {"performed": audit is not None, "tree_digest": release_digest if audit is not None else None, "open_medium_or_high_findings": len(substantive)}, "notes": ["No original-to-replacement map is stored in this manifest."]}
     write_json(output.with_suffix(output.suffix + ".manifest.json"), manifest)
     if vault_path is not None:
-        write_mapping_vault(vault_path, fingerprint, vault_passphrase or "")
+        write_mapping_vault(vault_path, fingerprint, vault_passphrase or "", release_digest)
     return manifest
 
 

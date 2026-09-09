@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from deidentify.engine import MAX_FILE_BYTES, ai_review_request, audit_request, build, build_plan, import_review, initial_fingerprint, preview, reidentify, scan
+from deidentify.engine import MAX_FILE_BYTES, ai_review_request, approved_replacements, audit_request, audit_review_template, build, build_plan, import_review, initial_fingerprint, portable_path_key, preview, reidentify, scan
 
 
 def approved(*entries):
@@ -30,6 +30,9 @@ class EngineTests(unittest.TestCase):
     def archive_text(self, output: Path, name: str) -> str:
         with tarfile.open(output) as archive:
             return archive.extractfile(name).read().decode("utf-8")
+
+    def audit_response(self, request, findings):
+        return {"tree_digest": request["tree_digest"], "batches": [{"batch_id": batch["batch_id"], "batch_digest": batch["batch_digest"], "findings": findings if index == 0 else []} for index, batch in enumerate(request["batches"])]}
 
     def test_scan_excludes_git_and_env(self):
         with tempfile.TemporaryDirectory() as name:
@@ -76,7 +79,7 @@ class EngineTests(unittest.TestCase):
             fingerprint = approved(("ProjectOrion", "project", ["ProjectOrion"]), ("CommonwealthBank", "customer", ["CommonwealthBank"]), ("mantle-platform", "internal_system", ["mantle-platform"]))
             output = parent / "release.tar.gz"; build(root, fingerprint, output)
             names = self.archive_names(output)
-            self.assertEqual({"docs/<PROJECT_001>/<CUSTOMER_001>/<INTERNAL_SYSTEM_001>.yml"}, names)
+            self.assertEqual({"docs/__PROJECT_001__/__CUSTOMER_001__/__INTERNAL_SYSTEM_001__.yml"}, names)
 
     def test_path_collision_fails_closed(self):
         with tempfile.TemporaryDirectory() as name:
@@ -96,7 +99,7 @@ class EngineTests(unittest.TestCase):
             output = parent / "release.tar.gz"; build(root, fingerprint, output)
             content = self.archive_text(output, "service.yml")
             self.assertNotIn("orion", content.casefold())
-            self.assertIn("<INTERNAL_SYSTEM_001>", content)
+            self.assertIn("__INTERNAL_SYSTEM_001__", content)
             self.assertIn("\r\n", content)
 
     def test_unsupported_files_reject_by_default_and_can_be_explicitly_excluded(self):
@@ -147,10 +150,13 @@ class EngineTests(unittest.TestCase):
             fingerprint = approved(("Orion", "project", ["Orion"]))
             request = audit_request(root, fingerprint)
             self.assertIn("Adversarial", request["purpose"])
-            audit = {"findings": [{"clue": "unique architecture", "confidence": "high", "status": "open"}]}
+            audit = self.audit_response(request, [{"clue": "unique architecture", "category": "architecture", "path": "ok.yml", "line": 1, "explanation": "distinctive", "confidence": "high", "status": "dismissed"}])
             with self.assertRaisesRegex(ValueError, "audit has 1"):
                 build(root, fingerprint, parent / "blocked.tar.gz", audit=audit, fail_on_ai_findings=True)
-            build(root, fingerprint, parent / "allowed.tar.gz", audit={"findings": [{"clue": "reviewed", "confidence": "high", "status": "dismissed"}]}, fail_on_ai_findings=True)
+            review = audit_review_template(root, fingerprint, audit)
+            finding_id = review["findings"][0]["finding_id"]
+            review["dismissals"] = [{"finding_id": finding_id, "status": "dismissed", "reason": "Human reviewer confirmed this is generic."}]
+            build(root, fingerprint, parent / "allowed.tar.gz", audit=audit, audit_review=review, fail_on_ai_findings=True)
 
     def test_preview_and_manifest_do_not_leak_fingerprint_mapping(self):
         with tempfile.TemporaryDirectory() as name:
@@ -162,7 +168,7 @@ class EngineTests(unittest.TestCase):
             manifest = output.with_suffix(".gz.manifest.json").read_text(encoding="utf-8")
             self.assertNotIn("Orion confidential", manifest)
             with tarfile.open(output) as archive:
-                info = archive.getmember("<PROJECT_001>.yml")
+                info = archive.getmember("__PROJECT_001__.yml")
             self.assertEqual(0, info.uid); self.assertEqual(0, info.gid); self.assertEqual(0, info.mtime)
 
     def test_archive_output_inside_source_is_rejected(self):
@@ -183,7 +189,7 @@ class EngineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as name:
             parent = Path(name); root = self.source(parent); (root / "ok.yml").write_text("Orion", encoding="utf-8")
             # A hostile/mistaken variant equal to the generated token must fail closed in final verification.
-            fingerprint = approved(("Orion", "project", ["Orion", "<PROJECT_001>"]))
+            fingerprint = approved(("Orion", "project", ["Orion", "__PROJECT_001__"]))
             with self.assertRaisesRegex(ValueError, "Final check"):
                 build(root, fingerprint, parent / "release.tar.gz")
 
@@ -197,7 +203,7 @@ class EngineTests(unittest.TestCase):
             returned = parent / "returned.tar.gz"; shutil.copyfile(deidentified, returned)
             restored = parent / "restored.tar.gz"
             manifest = reidentify(returned, vault, restored, "correct horse battery staple")
-            self.assertEqual("<INTERNAL_PRODUCT_001>.yml", self.archive_names(deidentified).pop())
+            self.assertEqual("__INTERNAL_PRODUCT_001__.yml", self.archive_names(deidentified).pop())
             self.assertEqual({"Orion Payments.yml"}, self.archive_names(restored))
             self.assertIn("Orion Payments", self.archive_text(restored, "Orion Payments.yml"))
             self.assertEqual(2, manifest["reidentified_token_occurrences"])
@@ -216,6 +222,62 @@ class EngineTests(unittest.TestCase):
                 archive.addfile(link)
             with self.assertRaisesRegex(ValueError, "non-regular"):
                 reidentify(returned, vault, parent / "restored.tar.gz", "passphrase")
+
+    def test_audit_digest_binds_response_to_exact_transformed_tree(self):
+        with tempfile.TemporaryDirectory() as name:
+            parent = Path(name); root = self.source(parent); source_file = root / "Orion.yml"
+            source_file.write_text("Orion", encoding="utf-8"); fingerprint = approved(("Orion", "project", ["Orion"]))
+            request = audit_request(root, fingerprint); audit = self.audit_response(request, [])
+            self.assertEqual(request["tree_digest"], audit_request(root, fingerprint)["tree_digest"])
+            build(root, fingerprint, parent / "exact.tar.gz", audit=audit, fail_on_ai_findings=True)
+            source_file.write_text("Orion changed", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "do not apply"):
+                build(root, fingerprint, parent / "changed-content.tar.gz", audit=audit, fail_on_ai_findings=True)
+            source_file.rename(root / "OrionRenamed.yml")
+            with self.assertRaisesRegex(ValueError, "do not apply"):
+                build(root, fingerprint, parent / "changed-path.tar.gz", audit=audit, fail_on_ai_findings=True)
+            changed_mapping = approved(("Orion", "internal_system", ["Orion"]))
+            self.assertNotEqual(request["tree_digest"], audit_request(root, changed_mapping)["tree_digest"])
+
+    def test_audit_response_and_human_review_validation_fail_closed(self):
+        with tempfile.TemporaryDirectory() as name:
+            parent = Path(name); root = self.source(parent); (root / "ok.yml").write_text("Orion", encoding="utf-8")
+            fingerprint = approved(("Orion", "project", ["Orion"])); request = audit_request(root, fingerprint)
+            malformed = {"tree_digest": "sha256:not-a-digest", "batches": []}
+            with self.assertRaisesRegex(ValueError, "do not apply"):
+                build(root, fingerprint, parent / "malformed.tar.gz", audit=malformed, fail_on_ai_findings=True)
+            audit = self.audit_response(request, [{"clue": "clue", "category": "project", "path": "ok.yml", "line": 1, "explanation": "why", "confidence": "medium"}])
+            bad_review = {"tree_digest": request["tree_digest"], "dismissals": [{"finding_id": "unknown", "status": "dismissed", "reason": "bad"}]}
+            with self.assertRaisesRegex(ValueError, "malformed"):
+                build(root, fingerprint, parent / "bad-review.tar.gz", audit=audit, audit_review=bad_review, fail_on_ai_findings=True)
+
+    def test_portable_tokens_and_short_variant_acknowledgement(self):
+        with tempfile.TemporaryDirectory() as name:
+            parent = Path(name); root = self.source(parent); (root / "AD.yml").write_text("AD AD", encoding="utf-8")
+            fingerprint = approved(("AD", "project", ["AD"]))
+            token = approved_replacements(fingerprint)[0][1]
+            self.assertFalse(set(token) & set('<>:"/\\|?*'))
+            self.assertNotIn(token.upper(), {"CON", "PRN", "AUX", "NUL"})
+            preview_data = preview(root, fingerprint)
+            self.assertEqual(2, preview_data["short_variant_risks"][0]["length"])
+            self.assertFalse(preview_data["short_variant_risks"][0]["acknowledged"])
+            with self.assertRaisesRegex(ValueError, "shorter than 4"):
+                build(root, fingerprint, parent / "blocked.tar.gz")
+            fingerprint["entries"][0]["short_variant_acknowledgements"] = {"AD": "Approved by release reviewer; this acronym must be removed."}
+            build(root, fingerprint, parent / "allowed.tar.gz")
+
+    def test_portable_path_collisions_are_case_insensitive(self):
+        # The host filesystem may itself be case-insensitive, so test the portable collision key directly.
+        self.assertEqual(portable_path_key(Path("Foo.yml")), portable_path_key(Path("foo.yml")))
+        self.assertEqual(portable_path_key(Path("name.")), portable_path_key(Path("name")))
+
+    def test_audit_coverage_includes_late_high_risk_and_end_of_file_content(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = self.source(Path(name)); (root / "aaa.py").write_text("x\n", encoding="utf-8")
+            (root / "zzz.tf").write_text("line\n" * 120 + "internal_orion_clue\n", encoding="utf-8")
+            request = audit_request(root, approved(("unused", "project", ["unused"])))
+            chunks = [chunk for batch in request["batches"] for chunk in batch["semantic_chunks"]]
+            self.assertTrue(any(chunk["path"] == "zzz.tf" and chunk["end_line"] >= 121 for chunk in chunks))
 
 
 if __name__ == "__main__":

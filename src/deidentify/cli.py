@@ -5,7 +5,7 @@ import getpass
 import sys
 from pathlib import Path
 
-from .engine import ai_review_request, audit_request, build, import_review, initial_fingerprint, load_json, preview, reidentify, require_outside_source, scan, validate_fingerprint, write_json
+from .engine import ai_review_request, audit_request, audit_review_template, build, import_review, initial_fingerprint, load_json, preview, reidentify, require_outside_source, scan, validate_fingerprint, write_json
 
 
 def parser() -> argparse.ArgumentParser:
@@ -26,6 +26,7 @@ def parser() -> argparse.ArgumentParser:
     build_cmd.add_argument("output", type=Path)
     build_cmd.add_argument("--unsupported-policy", choices=("reject", "exclude"), default="reject")
     build_cmd.add_argument("--audit-findings", type=Path)
+    build_cmd.add_argument("--audit-review", type=Path, help="Human-reviewed audit dismissals bound to the current tree digest.")
     build_cmd.add_argument("--fail-on-ai-findings", action="store_true")
     build_cmd.add_argument("--mapping-vault", type=Path, help="Write an encrypted token-to-canonical mapping outside the source tree.")
     preview_cmd = commands.add_parser("preview", help="Show planned path/content changes without writing an archive.")
@@ -38,6 +39,12 @@ def parser() -> argparse.ArgumentParser:
     audit_cmd.add_argument("fingerprint", type=Path)
     audit_cmd.add_argument("--output", type=Path, required=True)
     audit_cmd.add_argument("--unsupported-policy", choices=("reject", "exclude"), default="reject")
+    audit_review_cmd = commands.add_parser("audit-review-template", help="Create a human-review template from raw AI audit findings.")
+    audit_review_cmd.add_argument("source", type=Path)
+    audit_review_cmd.add_argument("fingerprint", type=Path)
+    audit_review_cmd.add_argument("audit_findings", type=Path)
+    audit_review_cmd.add_argument("--output", type=Path, required=True)
+    audit_review_cmd.add_argument("--unsupported-policy", choices=("reject", "exclude"), default="reject")
     reidentify_cmd = commands.add_parser("reidentify", help="Restore canonical values in a returned tarball using an encrypted mapping vault.")
     reidentify_cmd.add_argument("returned_archive", type=Path)
     reidentify_cmd.add_argument("mapping_vault", type=Path)
@@ -71,17 +78,20 @@ def main(argv: list[str] | None = None) -> int:
             require_outside_source(args.source, args.fingerprint, "Fingerprint")
             if args.audit_findings:
                 require_outside_source(args.source, args.audit_findings, "Audit findings")
+            if args.audit_review:
+                require_outside_source(args.source, args.audit_review, "Human audit review")
             if args.mapping_vault:
                 require_outside_source(args.source, args.mapping_vault, "Mapping vault")
             fingerprint = load_json(args.fingerprint)
             validate_fingerprint(fingerprint)
             audit = load_json(args.audit_findings) if args.audit_findings else None
+            audit_review = load_json(args.audit_review) if args.audit_review else None
             vault_passphrase = None
             if args.mapping_vault:
                 vault_passphrase = getpass.getpass("New mapping-vault passphrase: ")
                 if vault_passphrase != getpass.getpass("Confirm mapping-vault passphrase: "):
                     raise ValueError("Mapping-vault passphrases do not match")
-            manifest = build(args.source, fingerprint, args.output, args.unsupported_policy, audit, args.fail_on_ai_findings, args.mapping_vault, vault_passphrase)
+            manifest = build(args.source, fingerprint, args.output, unsupported_policy=args.unsupported_policy, audit=audit, audit_review=audit_review, fail_on_ai_findings=args.fail_on_ai_findings, vault_path=args.mapping_vault, vault_passphrase=vault_passphrase)
             print(f"Created archive: {args.output}")
             print(f"Manifest: {args.output.with_suffix(args.output.suffix + '.manifest.json')}")
             print(f"Applied {manifest['fingerprint']['entries_applied']} approved fingerprint entries.")
@@ -97,6 +107,10 @@ def main(argv: list[str] | None = None) -> int:
             fingerprint = load_json(args.fingerprint)
             write_json(args.output, audit_request(args.source, fingerprint, args.unsupported_policy))
             print(f"Adversarial internal-AI audit request: {args.output}")
+        elif args.command == "audit-review-template":
+            fingerprint = load_json(args.fingerprint)
+            write_json(args.output, audit_review_template(args.source, fingerprint, load_json(args.audit_findings), args.unsupported_policy))
+            print(f"Human audit-review template: {args.output}")
         elif args.command == "reidentify":
             manifest = reidentify(args.returned_archive, args.mapping_vault, args.output, getpass.getpass("Mapping-vault passphrase: "))
             print(f"Created reidentified archive: {args.output}")
