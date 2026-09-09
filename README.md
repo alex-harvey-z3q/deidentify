@@ -4,6 +4,10 @@
 
 This is an initial implementation. It is a release aid, not a guarantee of anonymity.
 
+## License
+
+This project is licensed under the [MIT License](LICENSE). Its canonical SPDX identifier is [`MIT`](https://spdx.org/licenses/MIT.html).
+
 ## Workflow
 
 1. Initialise an organisation fingerprint.
