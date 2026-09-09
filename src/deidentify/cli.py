@@ -4,7 +4,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from .engine import build, copilot_request, import_review, initial_fingerprint, load_json, scan, validate_fingerprint, write_json
+from .engine import ai_review_request, audit_request, build, import_review, initial_fingerprint, load_json, preview, require_outside_source, scan, validate_fingerprint, write_json
 
 
 def parser() -> argparse.ArgumentParser:
@@ -15,14 +15,27 @@ def parser() -> argparse.ArgumentParser:
     scan_cmd = commands.add_parser("scan", help="Discover local candidate identifiers.")
     scan_cmd.add_argument("source", type=Path)
     scan_cmd.add_argument("--report", type=Path, required=True)
-    scan_cmd.add_argument("--copilot-request", type=Path, required=True)
-    review = commands.add_parser("import-review", help="Import unapproved entries proposed by internal Copilot.")
+    scan_cmd.add_argument("--copilot-request", "--ai-review-request", dest="ai_review_request", type=Path, required=True)
+    review = commands.add_parser("import-review", help="Import unapproved entries proposed by sanctioned internal AI.")
     review.add_argument("fingerprint", type=Path)
     review.add_argument("review", type=Path)
     build_cmd = commands.add_parser("build", help="Build a fresh deidentified tarball from approved entries.")
     build_cmd.add_argument("source", type=Path)
     build_cmd.add_argument("fingerprint", type=Path)
     build_cmd.add_argument("output", type=Path)
+    build_cmd.add_argument("--unsupported-policy", choices=("reject", "exclude"), default="reject")
+    build_cmd.add_argument("--audit-findings", type=Path)
+    build_cmd.add_argument("--fail-on-ai-findings", action="store_true")
+    preview_cmd = commands.add_parser("preview", help="Show planned path/content changes without writing an archive.")
+    preview_cmd.add_argument("source", type=Path)
+    preview_cmd.add_argument("fingerprint", type=Path)
+    preview_cmd.add_argument("--output", type=Path, required=True)
+    preview_cmd.add_argument("--unsupported-policy", choices=("reject", "exclude"), default="reject")
+    audit_cmd = commands.add_parser("audit-request", help="Create a bounded adversarial audit request from staged content.")
+    audit_cmd.add_argument("source", type=Path)
+    audit_cmd.add_argument("fingerprint", type=Path)
+    audit_cmd.add_argument("--output", type=Path, required=True)
+    audit_cmd.add_argument("--unsupported-policy", choices=("reject", "exclude"), default="reject")
     return root
 
 
@@ -37,10 +50,10 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "scan":
             report = scan(args.source)
             write_json(args.report, report)
-            write_json(args.copilot_request, copilot_request(report))
+            write_json(args.ai_review_request, ai_review_request(report))
             print(f"Scanned {report['source']['scanned_file_count']} text files; found {len(report['candidate_inventory'])} candidate groups.")
             print(f"Report: {args.report}")
-            print(f"Internal Copilot request: {args.copilot_request}")
+            print(f"Internal-AI review request: {args.ai_review_request}")
         elif args.command == "import-review":
             fingerprint = load_json(args.fingerprint)
             review = load_json(args.review)
@@ -49,12 +62,26 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Imported review: {added} candidate entries added, {updated} entries updated.")
             print("Review the fingerprint and explicitly set vetted entries to status: approved before building.")
         elif args.command == "build":
+            require_outside_source(args.source, args.fingerprint, "Fingerprint")
+            if args.audit_findings:
+                require_outside_source(args.source, args.audit_findings, "Audit findings")
             fingerprint = load_json(args.fingerprint)
             validate_fingerprint(fingerprint)
-            manifest = build(args.source, fingerprint, args.output)
+            audit = load_json(args.audit_findings) if args.audit_findings else None
+            manifest = build(args.source, fingerprint, args.output, args.unsupported_policy, audit, args.fail_on_ai_findings)
             print(f"Created archive: {args.output}")
             print(f"Manifest: {args.output.with_suffix(args.output.suffix + '.manifest.json')}")
             print(f"Applied {manifest['fingerprint']['entries_applied']} approved fingerprint entries.")
+            if manifest["omitted_files"]:
+                print(f"Warning: {len(manifest['omitted_files'])} files/directories were omitted by policy.")
+        elif args.command == "preview":
+            fingerprint = load_json(args.fingerprint)
+            write_json(args.output, preview(args.source, fingerprint, args.unsupported_policy))
+            print(f"Preview: {args.output}")
+        elif args.command == "audit-request":
+            fingerprint = load_json(args.fingerprint)
+            write_json(args.output, audit_request(args.source, fingerprint, args.unsupported_policy))
+            print(f"Adversarial internal-AI audit request: {args.output}")
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

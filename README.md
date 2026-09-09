@@ -1,69 +1,85 @@
 # Deidentify Bundle
 
-`deidentify` is a local-first CLI for preparing a Git project or text bundle for external sharing. It does not modify the source directory. It supports a review workflow in which an organisation-sanctioned internal AI proposes organisation-fingerprint entries and a person explicitly approves entries before they are transformed.
+`deidentify` is a local-first release aid for preparing a Git project or text bundle for external sharing. It never modifies the selected source directory. It discovers possible organisational fingerprints, requires human approval before replacing them, writes a new tarball, and verifies the staged result before export.
 
-The internal AI is commonly GitHub Copilot in an enterprise-approved configuration, but Copilot is not a requirement. Any internal AI service is suitable if your organisation has approved the service, tenancy, data handling, retention, and access controls for this use. Do not send a review request to a public or otherwise unapproved AI service.
+It is not a guarantee of anonymity. Unique architecture, business logic, dependencies, or combinations of harmless facts can still identify an organisation. Treat it as one control in an approved public-release process.
 
-This is an initial implementation. It is a release aid, not a guarantee of anonymity.
+## Security model
 
-## License
+The tool reduces accidental disclosure of company, customer, project, internal-system, and infrastructure identifiers in text bundles. It assumes credential scanning and PII/DLP controls are enforced separately.
 
-This project is licensed under the [MIT License](LICENSE).
+- The source root must not be a symlink; symlinked files and directories are skipped and recorded.
+- Files use no-follow reads and must remain under the selected root.
+- `.git`, common key files, and environment files are excluded by policy.
+- Approved terms are replaced deterministically in file contents and paths; the source stays unchanged.
+- Builds fail for transformed-path collisions, unsafe output paths, approved terms left in staged paths/content, or unsupported files under the default policy.
+- Builds refuse to overwrite an existing archive or manifest.
+- Archive owner/group/timestamp metadata is normalised. The fingerprint and replacement map never enter the archive or manifest.
 
-## Workflow
+## Sanctioned internal AI
 
-1. Initialise an organisation fingerprint.
-2. Scan a source directory to produce a local candidate report and an internal-AI review request.
-3. Send the request only to your organisation-sanctioned internal AI environment.
-4. Import the AI's structured response as `candidate` entries.
-5. Review the fingerprint file and change vetted entries to `approved`.
-6. Build a new tarball. The source directory stays untouched.
+An organisation-sanctioned internal AI can improve discovery. Enterprise-approved GitHub Copilot is common, but not required. Use only an AI service whose tenancy, retention, data handling, and access controls are approved by your organisation. Never send review or audit artifacts to a public or unapproved service.
+
+The CLI does not call an AI provider. It writes bounded JSON artifacts so the provider boundary stays explicit. AI findings always import as `candidate`; only a person can mark an entry `approved`.
+
+## Recommended public-release workflow
+
+1. Run existing secrets and PII/DLP gates.
+2. Create or update a local, access-controlled fingerprint.
+3. Scan, submit the bounded review request to sanctioned internal AI, and import its candidates.
+4. Human-review the fingerprint and approve only vetted entries.
+5. Run `preview` and resolve unexpected changes, omissions, and collisions.
+6. Generate an adversarial audit request from staged content, submit it to the sanctioned AI, and review findings.
+7. Build with `--fail-on-ai-findings` for public release; resolve or explicitly dismiss open medium/high findings.
+8. Independently inspect the archive and manifest, then upload as a separate deliberate action.
 
 ```bash
 python -m pip install -e .
 
 deidentify init fingerprint.json
-deidentify scan /path/to/project --report scan-report.json --copilot-request internal-ai-request.json
-# `--copilot-request` is the current CLI flag name; the JSON itself is provider-neutral.
-# Send internal-ai-request.json only to the sanctioned internal AI service, then save its response.
-deidentify import-review fingerprint.json copilot-response.json
-# Edit fingerprint.json: set reviewed entries' status to "approved".
-deidentify build /path/to/project fingerprint.json output/project-deidentified.tar.gz
+deidentify scan /path/to/project --report scan-report.json \
+  --ai-review-request internal-ai-review.json
+# Submit only to sanctioned internal AI, then save its JSON response.
+deidentify import-review fingerprint.json internal-ai-response.json
+# Human review: set vetted entries in fingerprint.json to "approved".
+
+deidentify preview /path/to/project fingerprint.json --output preview.json
+deidentify audit-request /path/to/project fingerprint.json --output audit-request.json
+# Submit audit-request.json to sanctioned internal AI and save its response.
+deidentify build /path/to/project fingerprint.json output/project-deidentified.tar.gz \
+  --audit-findings audit-response.json --fail-on-ai-findings
 ```
 
-## Fingerprint states
+`--copilot-request` remains a compatible alias for `--ai-review-request`; the request content is provider-neutral.
 
-- `candidate`: proposed by a scanner or AI; never transformed.
-- `approved`: a reviewer has confirmed the term is identifying; transformed.
-- `ignored`: deliberately safe or generic; retained to avoid repeated review noise.
+## Discovery and review
 
-The fingerprint is sensitive organisational data. Keep it in an approved, access-controlled location and never include it in the exported archive.
+Static discovery ranks candidates from paths and file contents, retaining whether evidence is path- or content-based. It checks domains, URLs, email addresses/domains, IP addresses, UUIDs, AWS ARNs, Azure resource identifiers, proper names, PascalCase, lowerCamelCase, snake_case, uppercase identifiers, and kebab-case identifiers. Candidates are not declarations of sensitivity.
 
-## Internal-AI response format
+The AI review artifact includes a candidate inventory and at most 200 short source snippets. The bounded context helps discover aliases, codenames, naming conventions, and business context without sending the entire repository in one request.
 
-The sanctioned internal AI should return JSON in this shape. It may only propose entries; it cannot approve them. The current CLI does not call an AI provider directly: this explicit hand-off keeps provider selection and data-governance controls with your organisation.
+Fingerprint states are:
 
-```json
-{
-  "entries": [
-    {
-      "canonical": "Orion Payments",
-      "category": "internal_product",
-      "variants": ["Orion", "orion-api", "ORION_SERVICE"],
-      "confidence": "high",
-      "rationale": "Appears as a service, deployment, and API prefix.",
-      "evidence": [{"path": "services/orion/config.yml", "line": 4}]
-    }
-  ]
-}
-```
+- `candidate`: scanner or AI proposal; never transformed.
+- `approved`: human-confirmed identifier; transformed in preview/build.
+- `ignored`: reviewed as generic or safe.
 
-`category` is a safe identifier such as `company`, `internal_product`, `customer`, `internal_system`, or `project`. Replacement tokens are generated as `<CATEGORY_001>` per build and are consistent throughout that build. The original-to-token map is held in memory only and is not written to the manifest.
+Keep the fingerprint outside the source tree where possible and protect it as sensitive organisational data.
 
-## Safety characteristics and limits
+## AI response formats
 
-- `.git`, common secret files, binary files, large files, and build/vendor directories are excluded by default.
-- Only UTF-8 text files are transformed; files that cannot be decoded are excluded and recorded in the manifest.
-- The final staged output is checked for approved variants. Any unresolved occurrence blocks export.
-- Candidate discovery identifies unusual terms, not proven corporate identity. A human review is required.
-- This tool assumes secret scanning and PII/DLP controls are enforced elsewhere, as agreed for this project.
+Discovery responses are JSON with `entries`. Each entry needs `canonical`, `category`, `variants`, `confidence` (`low`, `medium`, or `high`), `rationale`, and `evidence` with path/line where available.
+
+Adversarial audit responses have `findings`, each with `clue`, `category`, `path`, `line`, `explanation`, `confidence`, and `status` (`open` or `dismissed`). `--fail-on-ai-findings` blocks on open medium/high findings.
+
+## Unsupported-file policy, preview, and verification
+
+Only recognised UTF-8 text files are transformed. Unknown extensions, binaries, malformed UTF-8, and files over 2 MB fail a build by default. This avoids silently creating an incomplete archive. Use `--unsupported-policy exclude` only after review; every omission and reason appears in the manifest and CLI summary. Archives, images, PDFs, generated artifacts, and other unknown files are not inspected by this version.
+
+`preview` writes a JSON record of changed paths/content, replacement counts, responsible approved entries, output count, and omissions. It never writes to source or produces an archive.
+
+Build uses longer variants first, case-insensitively, for contents and every path component. It independently scans staged paths and text after transformation; any residual approved variant blocks export.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE). Its canonical SPDX identifier is [`MIT`](https://spdx.org/licenses/MIT.html).
