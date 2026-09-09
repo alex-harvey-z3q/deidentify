@@ -1,19 +1,21 @@
 # Deidentify Bundle
 
-`deidentify` is a local-first CLI for preparing a Git project or text bundle for external sharing. It does not modify the source directory. It supports a review workflow in which an approved internal AI proposes organisation-fingerprint entries and a person explicitly approves entries before they are transformed.
+`deidentify` is a local-first CLI for preparing a Git project or text bundle for external sharing. It does not modify the source directory. It supports a review workflow in which an organisation-sanctioned internal AI proposes organisation-fingerprint entries and a person explicitly approves entries before they are transformed.
+
+The internal AI is commonly GitHub Copilot in an enterprise-approved configuration, but Copilot is not a requirement. Any internal AI service is suitable if your organisation has approved the service, tenancy, data handling, retention, and access controls for this use. Do not send a review request to a public or otherwise unapproved AI service.
 
 This is an initial implementation. It is a release aid, not a guarantee of anonymity.
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE). Its canonical SPDX identifier is [`MIT`](https://spdx.org/licenses/MIT.html).
+This project is licensed under the [MIT License](LICENSE).
 
 ## Workflow
 
 1. Initialise an organisation fingerprint.
-2. Scan a source directory to produce a local candidate report and a Copilot-review request.
-3. Send the request only to your approved internal Copilot environment.
-4. Import Copilot's structured response as `candidate` entries.
+2. Scan a source directory to produce a local candidate report and an internal-AI review request.
+3. Send the request only to your organisation-sanctioned internal AI environment.
+4. Import the AI's structured response as `candidate` entries.
 5. Review the fingerprint file and change vetted entries to `approved`.
 6. Build a new tarball. The source directory stays untouched.
 
@@ -21,8 +23,9 @@ This project is licensed under the [MIT License](LICENSE). Its canonical SPDX id
 python -m pip install -e .
 
 deidentify init fingerprint.json
-deidentify scan /path/to/project --report scan-report.json --copilot-request copilot-request.json
-# Send copilot-request.json to the approved internal service, then save its response.
+deidentify scan /path/to/project --report scan-report.json --copilot-request internal-ai-request.json
+# `--copilot-request` is the current CLI flag name; the JSON itself is provider-neutral.
+# Send internal-ai-request.json only to the sanctioned internal AI service, then save its response.
 deidentify import-review fingerprint.json copilot-response.json
 # Edit fingerprint.json: set reviewed entries' status to "approved".
 deidentify build /path/to/project fingerprint.json output/project-deidentified.tar.gz
@@ -36,9 +39,9 @@ deidentify build /path/to/project fingerprint.json output/project-deidentified.t
 
 The fingerprint is sensitive organisational data. Keep it in an approved, access-controlled location and never include it in the exported archive.
 
-## Copilot response format
+## Internal-AI response format
 
-Copilot should return JSON in this shape. It may only propose entries; it cannot approve them.
+The sanctioned internal AI should return JSON in this shape. It may only propose entries; it cannot approve them. The current CLI does not call an AI provider directly: this explicit hand-off keeps provider selection and data-governance controls with your organisation.
 
 ```json
 {
