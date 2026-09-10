@@ -63,7 +63,8 @@ class CliTests(unittest.TestCase):
             root = Path(name); source = root / "source"; source.mkdir(); (source / "ok.yml").write_text("Orion", encoding="utf-8")
             fingerprint_path = root / "fingerprint.json"; self.fingerprint(fingerprint_path)
             init = self.run_cli("init", str(source), str(source / "fingerprint.json"))
-            self.assertEqual(2, init.returncode); self.assertIn("outside the source repository", init.stderr)
+            self.assertEqual(0, init.returncode, init.stderr)
+            self.assertTrue((source / "fingerprint.json").exists())
             for command in (("scan", str(source), "--report", str(source / "report.json"), "--ai-review-request", str(root / "request.json")), ("audit-request", str(source), str(fingerprint_path), "--output", str(source / "audit.json")), ("preview", str(source), str(fingerprint_path), "--output", str(source / "preview.json")), ("build", str(source), str(fingerprint_path), str(source / "archive.tar.gz"))):
                 result = self.run_cli(*command)
                 self.assertEqual(2, result.returncode, result.stdout)

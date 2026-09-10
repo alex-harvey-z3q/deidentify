@@ -109,7 +109,6 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
         if args.command == "init":
-            require_workflow_artifacts_outside_source(args.source, fingerprint=args.fingerprint)
             if args.fingerprint.exists():
                 raise ValueError(f"Refusing to overwrite existing file: {args.fingerprint}")
             write_json(args.fingerprint, initial_fingerprint())

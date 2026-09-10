@@ -15,7 +15,7 @@ The tool reduces accidental disclosure of company, customer, project, internal-s
 - Builds fail for transformed-path collisions, unsafe output paths, approved terms left in staged paths/content, or unsupported files under the default policy.
 - Builds refuse to overwrite an existing archive or manifest.
 - Archive owner/group/timestamp metadata is normalised. The fingerprint and replacement map never enter the archive or manifest.
-- Every source-aware CLI command requires fingerprints, reports, AI request/response files, previews, audits, human reviews, vaults, archives, and manifests to live outside the selected source tree.
+- Release artifacts such as reports, AI request/response files, previews, audits, human reviews, vaults, archives, and manifests must live outside the selected source tree. `init` deliberately permits a fingerprint anywhere for a simple first-run experience, but keeping it outside the source tree is strongly recommended.
 
 ## Sanctioned internal AI
 
