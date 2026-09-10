@@ -175,9 +175,9 @@ def main(argv: list[str] | None = None) -> int:
             output = args.output or paths["archive"]
             vault_path = None if args.no_mapping_vault else (args.mapping_vault or paths["vault"])
             require_workflow_artifacts_outside_source(args.source, fingerprint=paths["fingerprint"], ai_review_response=review_path, archive_output=output, mapping_vault=vault_path)
+            vault_passphrase = mapping_vault_passphrase() if vault_path else None
             fingerprint, added, updated, approved = import_review(load_json(paths["fingerprint"]), load_json(review_path), approve_all=True)
             write_json(paths["fingerprint"], fingerprint)
-            vault_passphrase = mapping_vault_passphrase() if vault_path else None
             manifest = build(args.source, fingerprint, output, unsupported_policy=args.unsupported_policy, vault_path=vault_path, vault_passphrase=vault_passphrase)
             print(f"Imported review: {added} entries added, {updated} entries updated; approved {approved} touched entries.")
             print(f"Created archive: {output}")

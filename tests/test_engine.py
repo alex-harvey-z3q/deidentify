@@ -230,6 +230,17 @@ class EngineTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Could not decrypt"):
                 reidentify(returned, vault, parent / "wrong.tar.gz", "wrong passphrase")
 
+    def test_reidentify_accepts_extensionless_tokenized_filename(self):
+        with tempfile.TemporaryDirectory() as name:
+            parent = Path(name); root = self.source(parent)
+            (root / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+            fingerprint = approved(("Internal Dockerfile", "internal_system", ["Dockerfile"]))
+            deidentified = parent / "deidentified.tar.gz"; vault = parent / "mapping.vault.json"
+            build(root, fingerprint, deidentified, vault_path=vault, vault_passphrase="passphrase")
+            restored = parent / "restored.tar.gz"
+            reidentify(deidentified, vault, restored, "passphrase")
+            self.assertEqual({"Internal Dockerfile"}, self.archive_names(restored))
+
     def test_reidentify_rejects_unsafe_returned_archive_members(self):
         with tempfile.TemporaryDirectory() as name:
             parent = Path(name); vault = parent / "mapping.vault.json"

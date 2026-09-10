@@ -54,7 +54,7 @@ The individual `init`, `scan`, `import-review`, `approve`, `preview`, `audit-req
 
 By default, no reverse map is kept. Add `--mapping-vault` at build time only when you need to restore approved internal names after an external AI returns a modified archive. The CLI prompts for a passphrase and writes a separate encrypted vault using PBKDF2-HMAC-SHA256 and authenticated Fernet encryption. The vault records the originating transformed-tree digest as provenance, is never included in the deidentified archive or manifest, and must remain outside the source tree.
 
-`reidentify` reads a returned tarball without extracting it, rejects symlinks, unsafe paths, non-regular members, binary/non-UTF-8/unsupported files, and path collisions, then creates a fresh local tarball with normalised metadata. It never modifies the returned archive.
+`reidentify` reads a returned tarball without extracting it, rejects symlinks, unsafe paths, non-regular members, binary or non-UTF-8 files, and path collisions, then creates a fresh local tarball with normalised metadata. It accepts any UTF-8 filename because a token can replace an entire filename and remove its original extension. It never modifies the returned archive.
 
 Reidentification restores the approved **canonical** value for each token. Because deidentification intentionally maps several spelling/case variants to the same token, it cannot reconstruct every original spelling byte-for-byte. Keep the vault and its passphrase as sensitive credentials; losing either makes reidentification impossible.
 

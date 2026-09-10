@@ -20,7 +20,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 WINDOWS_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 DEFAULT_EXCLUDED_DIRS = {".git", ".hg", ".svn", "node_modules", "vendor", "dist", "build", ".venv", "venv", "__pycache__"}
 DEFAULT_EXCLUDED_FILE_NAMES = {".env", ".envrc", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"}
@@ -530,8 +530,6 @@ def reidentify(returned_archive: Path, vault_path: Path, output: Path, passphras
                 raise ValueError(f"Returned archive member exceeds {MAX_FILE_BYTES} bytes: {member.name}")
             stream = archive.extractfile(member)
             raw = stream.read() if stream else b""
-            if relative.suffix.lower() not in TEXT_EXTENSIONS and relative.name not in EXTENSIONLESS_TEXT:
-                raise ValueError(f"Returned archive has unsupported file type: {member.name}")
             if b"\x00" in raw:
                 raise ValueError(f"Returned archive has binary content: {member.name}")
             try:
