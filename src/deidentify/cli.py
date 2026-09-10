@@ -205,7 +205,7 @@ def main(argv: list[str] | None = None) -> int:
             manifest = reidentify(returned_archive=args.returned_archive, vault_path=args.mapping_vault, output=args.output, passphrase=getpass.getpass("Mapping-vault passphrase: "))
             print(f"Created reidentified archive: {args.output}")
             print(f"Manifest: {args.output.with_suffix(args.output.suffix + '.manifest.json')}")
-            print(f"Restored {manifest['reidentified_token_occurrences']} token occurrences to canonical values.")
+            print(f"Restored {manifest['reidentified_token_occurrences']} token occurrences to their original exact values.")
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

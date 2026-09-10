@@ -81,14 +81,15 @@ class EngineTests(unittest.TestCase):
             names = self.archive_names(output)
             self.assertEqual({"docs/__PROJECT_001__/__CUSTOMER_001__/__INTERNAL_SYSTEM_001__.yml"}, names)
 
-    def test_path_collision_fails_closed(self):
+    def test_exact_variant_tokens_avoid_path_collision(self):
         with tempfile.TemporaryDirectory() as name:
             parent = Path(name); root = self.source(parent)
             for directory in ("customer-acme", "customer-foo"):
                 (root / directory).mkdir(); (root / directory / "config.yml").write_text("ok", encoding="utf-8")
             fingerprint = approved(("Customer", "customer", ["customer-acme", "customer-foo"]))
-            with self.assertRaisesRegex(ValueError, "Path collision"):
-                build(root, fingerprint, parent / "release.tar.gz")
+            output = parent / "release.tar.gz"
+            build(root, fingerprint, output)
+            self.assertEqual({"__CUSTOMER_001__/config.yml", "__CUSTOMER_002__/config.yml"}, self.archive_names(output))
 
     def test_overlap_case_and_crlf_replacement_is_longest_first(self):
         with tempfile.TemporaryDirectory() as name:
@@ -113,6 +114,18 @@ class EngineTests(unittest.TestCase):
             manifest = build(root, fingerprint, parent / "exclude.tar.gz", unsupported_policy="exclude")
             self.assertEqual({"ok.yml"}, self.archive_names(parent / "exclude.tar.gz"))
             self.assertEqual("image.png", manifest["omitted_files"][0]["path"])
+
+    def test_content_based_text_detection_includes_unknown_extensions_and_extensionless_files(self):
+        with tempfile.TemporaryDirectory() as name:
+            parent = Path(name); root = self.source(parent)
+            (root / "Jenkinsfile").write_text("pipeline { agent any } // Orion\n", encoding="utf-8")
+            (root / "shared.groovy").write_text("def name = 'Orion'\n", encoding="utf-8")
+            fingerprint = approved(("Orion", "project", ["Orion"]))
+            output = parent / "release.tar.gz"
+            build(root, fingerprint, output)
+            self.assertEqual({"Jenkinsfile", "shared.groovy"}, self.archive_names(output))
+            self.assertNotIn("Orion", self.archive_text(output, "Jenkinsfile"))
+            self.assertNotIn("Orion", self.archive_text(output, "shared.groovy"))
 
     def test_large_and_malformed_utf8_files_are_explicit(self):
         with tempfile.TemporaryDirectory() as name:
@@ -213,7 +226,7 @@ class EngineTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Final check"):
                 build(root, fingerprint, parent / "release.tar.gz")
 
-    def test_encrypted_mapping_vault_reidentifies_to_canonical_values(self):
+    def test_encrypted_mapping_vault_reidentifies_exact_variants(self):
         with tempfile.TemporaryDirectory() as name:
             parent = Path(name); root = self.source(parent); (root / "Orion.yml").write_text("service: orion-api\n", encoding="utf-8")
             fingerprint = approved(("Orion Payments", "internal_product", ["Orion", "orion-api"]))
@@ -224,8 +237,8 @@ class EngineTests(unittest.TestCase):
             restored = parent / "restored.tar.gz"
             manifest = reidentify(returned, vault, restored, "correct horse battery staple")
             self.assertEqual("__INTERNAL_PRODUCT_001__.yml", self.archive_names(deidentified).pop())
-            self.assertEqual({"Orion Payments.yml"}, self.archive_names(restored))
-            self.assertIn("Orion Payments", self.archive_text(restored, "Orion Payments.yml"))
+            self.assertEqual({"Orion.yml"}, self.archive_names(restored))
+            self.assertIn("orion-api", self.archive_text(restored, "Orion.yml"))
             self.assertEqual(2, manifest["reidentified_token_occurrences"])
             with self.assertRaisesRegex(ValueError, "Could not decrypt"):
                 reidentify(returned, vault, parent / "wrong.tar.gz", "wrong passphrase")
@@ -239,7 +252,18 @@ class EngineTests(unittest.TestCase):
             build(root, fingerprint, deidentified, vault_path=vault, vault_passphrase="passphrase")
             restored = parent / "restored.tar.gz"
             reidentify(deidentified, vault, restored, "passphrase")
-            self.assertEqual({"Internal Dockerfile"}, self.archive_names(restored))
+            self.assertEqual({"Dockerfile"}, self.archive_names(restored))
+
+    def test_reidentify_round_trips_exact_paths_and_text(self):
+        with tempfile.TemporaryDirectory() as name:
+            parent = Path(name); root = self.source(parent)
+            (root / "Orion-ORION.yml").write_text("Orion ORION orion\n", encoding="utf-8")
+            fingerprint = approved(("Orion", "project", ["Orion", "ORION", "orion"]))
+            deidentified = parent / "deidentified.tar.gz"; vault = parent / "mapping.vault.json"; restored = parent / "restored.tar.gz"
+            build(root, fingerprint, deidentified, vault_path=vault, vault_passphrase="passphrase")
+            reidentify(deidentified, vault, restored, "passphrase")
+            self.assertEqual({"Orion-ORION.yml"}, self.archive_names(restored))
+            self.assertEqual("Orion ORION orion\n", self.archive_text(restored, "Orion-ORION.yml"))
 
     def test_reidentify_rejects_unsafe_returned_archive_members(self):
         with tempfile.TemporaryDirectory() as name:
@@ -286,14 +310,13 @@ class EngineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as name:
             parent = Path(name); root = self.source(parent); (root / "AD.yml").write_text("AD AD", encoding="utf-8")
             (root / "dirAD").mkdir(); (root / "dirAD" / "other.yml").write_text("aD", encoding="utf-8")
-            fingerprint = approved(("AD", "project", ["AD"]))
+            fingerprint = approved(("AD", "project", ["AD", "aD"]))
             token = approved_replacements(fingerprint)[0][1]
             self.assertFalse(set(token) & set('<>:"/\\|?*'))
             self.assertNotIn(token.upper(), {"CON", "PRN", "AUX", "NUL"})
             preview_data = preview(root, fingerprint)
-            self.assertEqual(2, preview_data["short_variant_risks"][0]["length"])
-            self.assertEqual(2, preview_data["short_variant_risks"][0]["affected_files"])
-            self.assertEqual(5, preview_data["short_variant_risks"][0]["occurrences"])
+            self.assertEqual({"AD", "aD"}, {risk["variant"] for risk in preview_data["short_variant_risks"]})
+            self.assertEqual(5, sum(risk["occurrences"] for risk in preview_data["short_variant_risks"]))
             build(root, fingerprint, parent / "allowed.tar.gz")
             self.assertNotIn("AD", self.archive_text(parent / "allowed.tar.gz", "__PROJECT_001__.yml"))
 

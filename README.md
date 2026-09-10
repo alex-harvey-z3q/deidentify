@@ -56,7 +56,7 @@ By default, no reverse map is kept. Add `--mapping-vault` at build time only whe
 
 `reidentify` reads a returned tarball without extracting it, rejects symlinks, unsafe paths, non-regular members, binary or non-UTF-8 files, and path collisions, then creates a fresh local tarball with normalised metadata. It accepts any UTF-8 filename because a token can replace an entire filename and remove its original extension. It never modifies the returned archive.
 
-Reidentification restores the approved **canonical** value for each token. Because deidentification intentionally maps several spelling/case variants to the same token, it cannot reconstruct every original spelling byte-for-byte. Keep the vault and its passphrase as sensitive credentials; losing either makes reidentification impossible.
+Each exact approved spelling/case variant receives its own token, so reidentification restores the original exported paths and UTF-8 text byte-for-byte when the returned archive preserves those tokens. Keep the vault and its passphrase as sensitive credentials; losing either makes reidentification impossible. Files omitted by `--unsupported-policy exclude` are not part of the bundle and cannot be restored.
 
 ## Discovery and review
 
@@ -86,11 +86,11 @@ The raw AI response must echo the exact `tree_digest` and return every required 
 
 ## Unsupported-file policy, preview, and verification
 
-Only recognised UTF-8 text files are transformed. Unknown extensions, binaries, malformed UTF-8, and files over 2 MB fail a build by default. This avoids silently creating an incomplete archive. Use `--unsupported-policy exclude` only after review; every omission and reason appears in the manifest and CLI summary. Archives, images, PDFs, generated artifacts, and other unknown files are not inspected by this version.
+Any regular file up to 2 MB is treated as text when its bytes are valid UTF-8 and contain no NUL byte, regardless of filename or extension. Binaries, malformed UTF-8, and files over 2 MB fail a build by default. This includes common project formats such as extensionless build files and Groovy scripts without maintaining an incomplete extension allowlist. Use `--unsupported-policy exclude` only after review; every omission and reason appears in the manifest and CLI summary. Binary archives, images, PDFs, package formats, and other non-text files are not inspected by this version.
 
 `preview` writes a JSON record of changed paths/content, replacement counts, responsible approved entries, output count, omissions, the transformed-tree digest, and short-variant risks. It never writes to source or produces an archive.
 
-Build uses longer variants first, case-insensitively, for contents and every path component. It independently scans staged paths and text after transformation; any residual approved variant blocks export. Path validation and collision checks use Windows-compatible semantics, including case folding and trailing dot/space handling.
+Build uses longer exact variants first for contents and every path component. It independently scans staged paths and text after transformation; any residual approved variant blocks export. Path validation and collision checks use Windows-compatible semantics, including case folding and trailing dot/space handling.
 
 Approved variants shorter than four characters are shown in preview with their affected-file and occurrence counts. They are transformed like every other approved variant; use this information to assess the impact of intentionally broad replacements.
 

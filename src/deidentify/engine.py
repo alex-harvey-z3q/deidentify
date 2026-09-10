@@ -20,14 +20,12 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 
-VERSION = "0.3.1"
+VERSION = "0.4.1"
 WINDOWS_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 DEFAULT_EXCLUDED_DIRS = {".git", ".hg", ".svn", "node_modules", "vendor", "dist", "build", ".venv", "venv", "__pycache__"}
 DEFAULT_EXCLUDED_FILE_NAMES = {".env", ".envrc", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"}
 GENERIC_PATH_COMPONENTS = {"src", "test", "tests", "docs", "doc", "main", "config", "configs", "assets", "scripts", "lib", "app", "api", "service", "services", "terraform"}
 MAX_FILE_BYTES = 2_000_000
-TEXT_EXTENSIONS = {".c", ".cfg", ".conf", ".cpp", ".cs", ".css", ".csv", ".go", ".h", ".html", ".ini", ".java", ".js", ".json", ".jsx", ".kt", ".md", ".php", ".properties", ".ps1", ".py", ".rb", ".rs", ".sh", ".sql", ".tf", ".toml", ".ts", ".tsx", ".txt", ".xml", ".yaml", ".yml"}
-EXTENSIONLESS_TEXT = {"Dockerfile", "Makefile", "LICENSE", "NOTICE", "README"}
 DOMAIN_RE = re.compile(r"(?<![@\w-])(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}(?![\w-])")
 URL_RE = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
 EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,63}\b")
@@ -174,8 +172,6 @@ def secure_read_bytes(root: Path, path: Path) -> tuple[bytes | None, str | None]
 
 
 def read_text_file(root: Path, path: Path) -> tuple[str | None, str | None]:
-    if path.suffix.lower() not in TEXT_EXTENSIONS and path.name not in EXTENSIONLESS_TEXT:
-        return None, "unsupported file type"
     raw, reason = secure_read_bytes(root, path)
     if reason:
         return None, reason
@@ -279,8 +275,10 @@ def approve_candidates(fingerprint: dict[str, Any]) -> tuple[dict[str, Any], int
 def approved_replacements(fingerprint: dict[str, Any]) -> list[tuple[str, str, str]]:
     counters: Counter[str] = Counter(); replacements = []
     for entry in sorted((e for e in validate_fingerprint(fingerprint) if e["status"] == "approved"), key=lambda e: (e["category"], e["canonical"].casefold())):
-        counters[entry["category"]] += 1; token = f"__{entry['category'].upper()}_{counters[entry['category']]:03d}__"
-        replacements.extend((variant, token, entry["canonical"]) for variant in entry["variants"])
+        for variant in dict.fromkeys(entry["variants"]):
+            counters[entry["category"]] += 1
+            token = f"__{entry['category'].upper()}_{counters[entry['category']]:03d}__"
+            replacements.append((variant, token, entry["canonical"]))
     return sorted(replacements, key=lambda item: len(item[0]), reverse=True)
 
 
@@ -288,8 +286,8 @@ def mapping_vault(fingerprint: dict[str, Any], passphrase: str, release_tree_dig
     if not passphrase:
         raise ValueError("Mapping-vault passphrase must not be empty")
     token_map: dict[str, str] = {}
-    for _, token, canonical in approved_replacements(fingerprint):
-        token_map[token] = canonical
+    for variant, token, _ in approved_replacements(fingerprint):
+        token_map[token] = variant
     if not token_map:
         raise ValueError("No approved mappings available for a vault")
     salt = os.urandom(16)
@@ -323,7 +321,7 @@ def decrypt_mapping_vault(path: Path, passphrase: str) -> dict[str, str]:
 def replace_text(text: str, replacements: list[tuple[str, str, str]]) -> tuple[str, set[str], int]:
     applied: set[str] = set(); count = 0
     for variant, token, canonical in replacements:
-        text, replaced = re.subn(re.escape(variant), token, text, flags=re.IGNORECASE)
+        text, replaced = re.subn(re.escape(variant), token, text)
         if replaced: applied.add(canonical); count += replaced
     return text, applied, count
 
@@ -380,7 +378,7 @@ def short_variant_risks(fingerprint: dict[str, Any], plan: list[dict[str, Any]])
                 continue
             files = 0; occurrences = 0
             for item in plan:
-                count = len(re.findall(re.escape(variant), item["relative"].as_posix(), re.IGNORECASE)) + len(re.findall(re.escape(variant), item["original_text"], re.IGNORECASE))
+                count = len(re.findall(re.escape(variant), item["relative"].as_posix())) + len(re.findall(re.escape(variant), item["original_text"]))
                 if count:
                     files += 1; occurrences += count
             risks.append({"canonical": entry["canonical"], "variant": variant, "length": len(variant), "affected_files": files, "occurrences": occurrences})
@@ -394,7 +392,7 @@ def preview(source: Path, fingerprint: dict[str, Any], unsupported_policy: str =
 
 
 def remaining_approved(text: str, replacements: list[tuple[str, str, str]]) -> set[str]:
-    return {canonical for variant, _, canonical in replacements if re.search(re.escape(variant), text, re.IGNORECASE)}
+    return {canonical for variant, _, canonical in replacements if re.search(re.escape(variant), text)}
 
 
 AUDIT_CHUNKS_PER_BATCH = 25
