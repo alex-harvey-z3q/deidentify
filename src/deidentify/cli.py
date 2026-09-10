@@ -18,6 +18,31 @@ def require_workflow_artifacts_outside_source(source: Path, **artifacts: Path | 
             raise ValueError(f"{label.replace('_', ' ')} must be outside the source repository:\nsource: {source.absolute()}\nartifact: {path.absolute()}") from exc
 
 
+def workspace_paths(workspace: Path, source: Path) -> dict[str, Path]:
+    """Return the conventional artifact locations for the short workflow."""
+    require_workflow_artifacts_outside_source(source, workspace=workspace)
+    bundle_name = f"{source_root_name(source)}-deidentified.tar.gz"
+    return {
+        "fingerprint": workspace / "fingerprint.json",
+        "report": workspace / "scan-report.json",
+        "request": workspace / "internal-ai-review-request.json",
+        "review": workspace / "internal-ai-review-response.json",
+        "archive": workspace / bundle_name,
+        "vault": workspace / f"{bundle_name}.mapping.vault.json",
+    }
+
+
+def source_root_name(source: Path) -> str:
+    return source.absolute().resolve(strict=True).name
+
+
+def mapping_vault_passphrase() -> str:
+    passphrase = getpass.getpass("New mapping-vault passphrase: ")
+    if passphrase != getpass.getpass("Confirm mapping-vault passphrase: "):
+        raise ValueError("Mapping-vault passphrases do not match")
+    return passphrase
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="deidentify", description="Create reviewed deidentified text bundles locally.")
     commands = root.add_subparsers(dest="command", required=True)
@@ -28,6 +53,9 @@ def parser() -> argparse.ArgumentParser:
     scan_cmd.add_argument("source", type=Path)
     scan_cmd.add_argument("--report", type=Path, required=True)
     scan_cmd.add_argument("--copilot-request", "--ai-review-request", dest="ai_review_request", type=Path, required=True)
+    prepare_cmd = commands.add_parser("prepare", help="Start the short workflow: create/update a workspace and write one internal-AI review request.")
+    prepare_cmd.add_argument("source", type=Path)
+    prepare_cmd.add_argument("--workspace", type=Path, required=True, help="Secure directory outside the source for the fingerprint and workflow artifacts.")
     review = commands.add_parser("import-review", help="Import unapproved entries proposed by sanctioned internal AI.")
     review.add_argument("source", type=Path)
     review.add_argument("fingerprint", type=Path)
@@ -46,6 +74,14 @@ def parser() -> argparse.ArgumentParser:
     build_cmd.add_argument("--audit-review", type=Path, help="Human-reviewed audit dismissals bound to the current tree digest.")
     build_cmd.add_argument("--fail-on-ai-findings", action="store_true")
     build_cmd.add_argument("--mapping-vault", type=Path, help="Write an encrypted token-to-canonical mapping outside the source tree.")
+    package_cmd = commands.add_parser("package", help="Finish the short workflow: import and approve this AI review, then build a reversible bundle.")
+    package_cmd.add_argument("source", type=Path)
+    package_cmd.add_argument("--workspace", type=Path, required=True, help="Workspace previously created by prepare.")
+    package_cmd.add_argument("--review", type=Path, help="Internal-AI response JSON; defaults to WORKSPACE/internal-ai-review-response.json.")
+    package_cmd.add_argument("--output", type=Path, help="Archive output; defaults inside the workspace.")
+    package_cmd.add_argument("--mapping-vault", type=Path, help="Encrypted reverse map; defaults inside the workspace.")
+    package_cmd.add_argument("--no-mapping-vault", action="store_true", help="Do not create a reverse map; reidentification will not be possible.")
+    package_cmd.add_argument("--unsupported-policy", choices=("reject", "exclude"), default="exclude", help="Defaults to exclude so non-text files do not block this streamlined workflow.")
     preview_cmd = commands.add_parser("preview", help="Show planned path/content changes without writing an archive.")
     preview_cmd.add_argument("source", type=Path)
     preview_cmd.add_argument("fingerprint", type=Path)
@@ -86,6 +122,19 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Scanned {report['source']['scanned_file_count']} text files; found {len(report['candidate_inventory'])} candidate groups.")
             print(f"Report: {args.report}")
             print(f"Internal-AI review request: {args.ai_review_request}")
+        elif args.command == "prepare":
+            paths = workspace_paths(args.workspace, args.source)
+            if paths["fingerprint"].exists():
+                fingerprint = load_json(paths["fingerprint"])
+                validate_fingerprint(fingerprint)
+            else:
+                write_json(paths["fingerprint"], initial_fingerprint())
+            report = scan(source=args.source)
+            write_json(paths["report"], report)
+            write_json(paths["request"], ai_review_request(report))
+            print(f"Prepared workspace: {args.workspace}")
+            print(f"Internal-AI review request: {paths['request']}")
+            print("Save the internal-AI response as: " + str(paths["review"]))
         elif args.command == "import-review":
             require_workflow_artifacts_outside_source(args.source, fingerprint=args.fingerprint, ai_review_response=args.review)
             fingerprint = load_json(args.fingerprint)
@@ -110,9 +159,7 @@ def main(argv: list[str] | None = None) -> int:
             audit_review = load_json(args.audit_review) if args.audit_review else None
             vault_passphrase = None
             if args.mapping_vault:
-                vault_passphrase = getpass.getpass("New mapping-vault passphrase: ")
-                if vault_passphrase != getpass.getpass("Confirm mapping-vault passphrase: "):
-                    raise ValueError("Mapping-vault passphrases do not match")
+                vault_passphrase = mapping_vault_passphrase()
             manifest = build(args.source, fingerprint, args.output, unsupported_policy=args.unsupported_policy, audit=audit, audit_review=audit_review, fail_on_ai_findings=args.fail_on_ai_findings, vault_path=args.mapping_vault, vault_passphrase=vault_passphrase)
             print(f"Created archive: {args.output}")
             print(f"Manifest: {args.output.with_suffix(args.output.suffix + '.manifest.json')}")
@@ -121,6 +168,25 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Warning: {len(manifest['omitted_files'])} files/directories were omitted by policy.")
             if args.mapping_vault:
                 print(f"Encrypted mapping vault: {args.mapping_vault}")
+        elif args.command == "package":
+            paths = workspace_paths(args.workspace, args.source)
+            if args.no_mapping_vault and args.mapping_vault:
+                raise ValueError("--no-mapping-vault cannot be combined with --mapping-vault")
+            review_path = args.review or paths["review"]
+            output = args.output or paths["archive"]
+            vault_path = None if args.no_mapping_vault else (args.mapping_vault or paths["vault"])
+            require_workflow_artifacts_outside_source(args.source, fingerprint=paths["fingerprint"], ai_review_response=review_path, archive_output=output, mapping_vault=vault_path)
+            fingerprint, added, updated, approved = import_review(load_json(paths["fingerprint"]), load_json(review_path), approve_all=True)
+            write_json(paths["fingerprint"], fingerprint)
+            vault_passphrase = mapping_vault_passphrase() if vault_path else None
+            manifest = build(args.source, fingerprint, output, unsupported_policy=args.unsupported_policy, vault_path=vault_path, vault_passphrase=vault_passphrase)
+            print(f"Imported review: {added} entries added, {updated} entries updated; approved {approved} touched entries.")
+            print(f"Created archive: {output}")
+            print(f"Manifest: {output.with_suffix(output.suffix + '.manifest.json')}")
+            if manifest["omitted_files"]:
+                print(f"Warning: {len(manifest['omitted_files'])} files/directories were omitted by policy.")
+            if vault_path:
+                print(f"Encrypted mapping vault: {vault_path}")
         elif args.command == "preview":
             require_workflow_artifacts_outside_source(args.source, fingerprint=args.fingerprint, preview_output=args.output)
             fingerprint = load_json(args.fingerprint)

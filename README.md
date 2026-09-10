@@ -1,6 +1,6 @@
 # Deidentify Bundle
 
-`deidentify` is a local-first release aid for preparing a Git project or text bundle for external sharing. It never modifies the selected source directory. It discovers possible organisational fingerprints, requires human approval before replacing them, writes a new tarball, and verifies the staged result before export.
+`deidentify` is a local-first release aid for preparing a Git project or text bundle for external sharing. It never modifies the selected source directory. It discovers possible organisational fingerprints, uses an organisation-sanctioned internal AI to select replacements, writes a new tarball, and verifies the staged result before export.
 
 It is not a guarantee of anonymity. Unique architecture, business logic, dependencies, or combinations of harmless facts can still identify an organisation. Treat it as one control in an approved public-release process.
 
@@ -21,51 +21,34 @@ The tool reduces accidental disclosure of company, customer, project, internal-s
 
 An organisation-sanctioned internal AI can improve discovery. Enterprise-approved GitHub Copilot is common, but not required. Use only an AI service whose tenancy, retention, data handling, and access controls are approved by your organisation. Never send review or audit artifacts to a public or unapproved service.
 
-The CLI does not call an AI provider. It writes bounded JSON artifacts so the provider boundary stays explicit. AI may discover findings; AI may not approve fingerprint entries or dismiss audit findings. Human review is authoritative.
+The CLI does not call an AI provider. It writes bounded JSON artifacts so the provider boundary stays explicit. In the streamlined workflow below, choosing `package` explicitly accepts every entry added or updated by that internal-AI response. This is deliberately less conservative than the advanced commands: the internal AI is the decision-maker for that release, and unrelated candidate entries remain untouched.
 
-## Recommended public-release workflow
+## Streamlined workflow
 
-1. Run existing secrets and PII/DLP gates.
-2. Create or update a local, access-controlled fingerprint.
-3. Scan, submit the bounded review request to sanctioned internal AI, and import its candidates.
-4. Human-review the fingerprint and approve only vetted entries.
-5. Run `preview` and resolve unexpected changes, omissions, and collisions.
-6. Generate adversarial audit request batches from staged content and submit every batch to the sanctioned AI.
-7. Generate a human-review template, explicitly dismiss only reviewed findings with a reason, then build with `--fail-on-ai-findings`.
-8. Independently inspect the archive and manifest, then upload as a separate deliberate action.
+This is the intended default for teams that already run secret/PII/DLP gates and accept a pragmatic rather than perfect result. It has two local commands and one internal-AI hand-off:
 
 ```bash
 python -m pip install -e .
 
-deidentify init /path/to/project fingerprint.json
-deidentify scan /path/to/project --report scan-report.json \
-  --ai-review-request internal-ai-review.json
-# Submit only to sanctioned internal AI, then save its JSON response.
-deidentify import-review /path/to/project fingerprint.json internal-ai-response.json
-# Human review: set vetted entries in fingerprint.json to "approved".
-
-# Optional convenience workflow: explicitly approve only entries in this import.
-deidentify import-review /path/to/project fingerprint.json internal-ai-response.json --approve-all
-# Or explicitly approve every candidate already in the reviewed fingerprint.
-deidentify approve /path/to/project fingerprint.json --all
-
-deidentify preview /path/to/project fingerprint.json --output preview.json
-deidentify audit-request /path/to/project fingerprint.json --output audit-request.json
-# Submit audit-request.json to sanctioned internal AI and save its response.
-deidentify audit-review-template /path/to/project fingerprint.json audit-response.json \
-  --output human-audit-review.json
-# Human reviewer adds justified dismissals to human-audit-review.json.
-deidentify build /path/to/project fingerprint.json output/project-deidentified.tar.gz \
-  --audit-findings audit-response.json --audit-review human-audit-review.json \
-  --fail-on-ai-findings \
-  --mapping-vault secure/project-mapping.vault.json
+deidentify prepare /path/to/project --workspace /secure/deidentify-work
+# Send only /secure/deidentify-work/internal-ai-review-request.json to the sanctioned internal AI.
+# Save its JSON response as /secure/deidentify-work/internal-ai-review-response.json.
+deidentify package /path/to/project --workspace /secure/deidentify-work
 
 # After ChatGPT returns a modified tarball, restore it only in an approved local environment.
-deidentify reidentify returned-from-chatgpt.tar.gz secure/project-mapping.vault.json \
+deidentify reidentify returned-from-chatgpt.tar.gz /secure/deidentify-work/project-deidentified.tar.gz.mapping.vault.json \
   restored-internal.tar.gz
 ```
 
+`prepare` creates or reuses `fingerprint.json` in the workspace, scans the source, and writes the bounded review request. `package` imports the saved response, approves exactly the entries touched by that response, then builds an archive and an encrypted mapping vault. It prompts for the vault passphrase. Its default `--unsupported-policy exclude` omits non-text files rather than blocking the bundle; omissions are recorded in the manifest. Use `--unsupported-policy reject` when completeness matters more than convenience.
+
+The workspace is sensitive: it holds the accumulated organisation fingerprint, the AI review artifacts, and the encrypted vault. Keep it outside the repository and in an access-controlled location. `package --no-mapping-vault` is available only when reidentification is not needed.
+
 `--copilot-request` remains a compatible alias for `--ai-review-request`; the request content is provider-neutral.
+
+## Advanced controls
+
+The individual `init`, `scan`, `import-review`, `approve`, `preview`, `audit-request`, `audit-review-template`, and `build` commands remain available for a more conservative release process. They allow separate human approval, preview, and adversarial audit gates when required.
 
 ## Optional reidentification
 
@@ -84,12 +67,12 @@ The AI review artifact includes a candidate inventory and at most 200 short sour
 Fingerprint states are:
 
 - `candidate`: scanner or AI proposal; never transformed.
-- `approved`: human-confirmed identifier; transformed in preview/build.
+- `approved`: identifier accepted for transformation; transformed in preview/build.
 - `ignored`: reviewed as generic or safe.
 
 Keep the fingerprint outside the source tree where possible and protect it as sensitive organisational data.
 
-`import-review --approve-all` is an explicit user decision to accept all candidates touched by that AI review. It never honours an AI-provided status field on its own, and it does not change unrelated existing candidates. `approve --all` is the separate explicit action for all current candidates in a fingerprint.
+`package` and `import-review --approve-all` are explicit user decisions to accept all candidates touched by that AI review. They never honour an AI-provided status field on its own, and they do not change unrelated existing candidates. `approve --all` is the separate explicit action for all current candidates in a fingerprint.
 
 ## Audit binding and AI response formats
 

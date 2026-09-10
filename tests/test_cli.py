@@ -5,7 +5,9 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from deidentify.cli import main
 from deidentify.engine import audit_request
 
 
@@ -90,3 +92,23 @@ class CliTests(unittest.TestCase):
             self.assertEqual(0, all_candidates.returncode, all_candidates.stderr); self.assertIn("Approved 1 candidate entries", all_candidates.stdout)
             statuses = {entry["canonical"]: entry["status"] for entry in json.loads(fingerprint_path.read_text())["entries"]}
             self.assertEqual("approved", statuses["Existing"])
+
+    def test_short_workflow_prepares_then_packages_a_reversible_bundle(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); source = root / "source"; source.mkdir()
+            (source / "orion.yml").write_text("service: Orion\n", encoding="utf-8")
+            (source / "diagram.png").write_bytes(b"\x89PNG\x00")
+            workspace = root / "secure-workspace"
+
+            self.assertEqual(0, main(["prepare", str(source), "--workspace", str(workspace)]))
+            self.assertTrue((workspace / "fingerprint.json").exists())
+            self.assertTrue((workspace / "internal-ai-review-request.json").exists())
+            (workspace / "internal-ai-review-response.json").write_text(json.dumps({"entries": [{"canonical": "Orion", "category": "project", "variants": ["Orion"], "confidence": "high", "rationale": "Internal project name", "evidence": [{"path": "orion.yml", "line": 1}]}]}), encoding="utf-8")
+
+            with patch("deidentify.cli.getpass.getpass", side_effect=["correct horse battery staple", "correct horse battery staple"]):
+                self.assertEqual(0, main(["package", str(source), "--workspace", str(workspace)]))
+
+            fingerprint = json.loads((workspace / "fingerprint.json").read_text(encoding="utf-8"))
+            self.assertEqual("approved", fingerprint["entries"][0]["status"])
+            self.assertTrue((workspace / "source-deidentified.tar.gz").exists())
+            self.assertTrue((workspace / "source-deidentified.tar.gz.mapping.vault.json").exists())
