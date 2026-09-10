@@ -134,6 +134,26 @@ class EngineTests(unittest.TestCase):
             fingerprint, added, _, _ = import_review(initial_fingerprint(), {"entries": [{"canonical": "ProjectOrion", "category": "project", "variants": ["ProjectOrion"], "status": "approved", "confidence": "high", "rationale": "test", "evidence": []}]})
             self.assertEqual(1, added); self.assertEqual("candidate", fingerprint["entries"][0]["status"])
 
+    def test_import_review_approve_all_affects_only_touched_entries(self):
+        fingerprint = initial_fingerprint()
+        fingerprint["entries"] = [
+            {"canonical": "Existing Candidate", "category": "project", "variants": ["Existing"], "status": "candidate"},
+            {"canonical": "Unrelated Candidate", "category": "project", "variants": ["Unrelated"], "status": "candidate"},
+            {"canonical": "Already Approved", "category": "project", "variants": ["Already"], "status": "approved"},
+        ]
+        review = {"entries": [
+            {"canonical": "Existing Candidate", "category": "project", "variants": ["ExistingNew"], "confidence": "high", "rationale": "update", "evidence": []},
+            {"canonical": "New Candidate", "category": "project", "variants": ["New"], "confidence": "high", "rationale": "add", "evidence": []},
+            {"canonical": "Already Approved", "category": "project", "variants": ["AlreadyNew"], "confidence": "high", "rationale": "update", "evidence": []},
+        ]}
+        updated_fingerprint, added, updated, approved = import_review(fingerprint, review, approve_all=True)
+        statuses = {entry["canonical"]: entry["status"] for entry in updated_fingerprint["entries"]}
+        self.assertEqual((1, 2, 3), (added, updated, approved))
+        self.assertEqual("approved", statuses["Existing Candidate"])
+        self.assertEqual("approved", statuses["New Candidate"])
+        self.assertEqual("approved", statuses["Already Approved"])
+        self.assertEqual("candidate", statuses["Unrelated Candidate"])
+
     def test_static_discovery_covers_cloud_network_and_identifier_signals(self):
         with tempfile.TemporaryDirectory() as name:
             root = self.source(Path(name))

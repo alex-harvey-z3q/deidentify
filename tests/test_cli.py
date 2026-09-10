@@ -83,7 +83,7 @@ class CliTests(unittest.TestCase):
             statuses = {entry["canonical"]: entry["status"] for entry in json.loads(fingerprint_path.read_text())["entries"]}
             self.assertEqual("candidate", statuses["Orion"])
             approved = self.run_cli("import-review", str(source), str(fingerprint_path), str(review_path), "--approve-all")
-            self.assertEqual(0, approved.returncode, approved.stderr); self.assertIn("Approved 1 imported entries", approved.stdout)
+            self.assertEqual(0, approved.returncode, approved.stderr); self.assertIn("Approved 1 imported/updated entries", approved.stdout)
             statuses = {entry["canonical"]: entry["status"] for entry in json.loads(fingerprint_path.read_text())["entries"]}
             self.assertEqual("approved", statuses["Orion"]); self.assertEqual("candidate", statuses["Existing"]); self.assertEqual("approved", statuses["Already"])
             all_candidates = self.run_cli("approve", str(source), str(fingerprint_path), "--all")

@@ -250,7 +250,7 @@ def ai_review_request(report: dict[str, Any]) -> dict[str, Any]:
 def import_review(fingerprint: dict[str, Any], review: dict[str, Any], approve_all: bool = False) -> tuple[dict[str, Any], int, int, int]:
     entries = review.get("entries")
     if not isinstance(entries, list): raise ValueError("review.entries must be a list")
-    current = validate_fingerprint(fingerprint); by_name = {entry["canonical"].casefold(): entry for entry in current}; added = updated = approved = 0
+    current = validate_fingerprint(fingerprint); by_name = {entry["canonical"].casefold(): entry for entry in current}; added = updated = 0; approved_keys: set[str] = set()
     for index, proposal in enumerate(entries):
         if not isinstance(proposal, dict): raise ValueError(f"review.entries[{index}] must be an object")
         canonical, category, variants, confidence = proposal.get("canonical"), proposal.get("category"), proposal.get("variants"), proposal.get("confidence", "medium")
@@ -260,10 +260,11 @@ def import_review(fingerprint: dict[str, Any], review: dict[str, Any], approve_a
             target = by_name[key]; target["variants"] = sorted(set(target["variants"]) | set(variants) | {canonical.strip()}, key=str.casefold); target.setdefault("evidence", []).extend(proposal.get("evidence", []) if isinstance(proposal.get("evidence", []), list) else []); target.setdefault("rationales", []).append(str(proposal.get("rationale", ""))); target["last_seen"] = utc_now(); updated += 1
         else:
             target = {"canonical": canonical.strip(), "category": category, "variants": sorted(set(variants) | {canonical.strip()}, key=str.casefold), "status": "candidate", "confidence": confidence, "rationales": [str(proposal.get("rationale", ""))], "evidence": proposal.get("evidence", []) if isinstance(proposal.get("evidence", []), list) else [], "first_seen": utc_now(), "last_seen": utc_now()}; current.append(target); by_name[key] = target; added += 1
-        if approve_all and target["status"] != "approved":
-            target["status"] = "approved"; approved += 1
+        if approve_all:
+            target["status"] = "approved"
+            approved_keys.add(key)
     fingerprint["entries"] = sorted(current, key=lambda item: item["canonical"].casefold()); fingerprint["updated_at"] = utc_now(); validate_fingerprint(fingerprint)
-    return fingerprint, added, updated, approved
+    return fingerprint, added, updated, len(approved_keys)
 
 
 def approve_candidates(fingerprint: dict[str, Any]) -> tuple[dict[str, Any], int]:

@@ -94,7 +94,7 @@ def main(argv: list[str] | None = None) -> int:
             write_json(args.fingerprint, fingerprint)
             print(f"Imported review: {added} candidate entries added, {updated} entries updated.")
             if args.approve_all:
-                print(f"Approved {approved} imported entries.")
+                print(f"Approved {approved} imported/updated entries.")
             else:
                 print("Review the fingerprint and explicitly set vetted entries to status: approved before building.")
         elif args.command == "approve":
