@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from deidentify.engine import MAX_FILE_BYTES, ai_review_request, approved_replacements, audit_request, audit_review_template, build, build_plan, import_review, initial_fingerprint, portable_path_key, preview, reidentify, scan
+from deidentify.engine import MAX_FILE_BYTES, ai_review_batches, ai_review_request, approved_replacements, audit_request, audit_review_template, build, build_plan, import_review, initial_fingerprint, json_size, portable_path_key, preview, reidentify, scan
 
 
 def approved(*entries):
@@ -146,6 +146,17 @@ class EngineTests(unittest.TestCase):
             self.assertIn("cannot approve", request["purpose"])
             fingerprint, added, _, _ = import_review(initial_fingerprint(), {"entries": [{"canonical": "ProjectOrion", "category": "project", "variants": ["ProjectOrion"], "status": "approved", "confidence": "high", "rationale": "test", "evidence": []}]})
             self.assertEqual(1, added); self.assertEqual("candidate", fingerprint["entries"][0]["status"])
+
+    def test_ai_review_batches_cover_compacted_context_with_a_byte_limit(self):
+        report = {
+            "candidate_inventory": [{"term": f"InternalThing{index}", "kind": "pascal_identifier", "score": 45, "occurrences": 1, "evidence": [{"path": f"component-{index}.groovy", "line": 1, "source": "content"}] * 4} for index in range(30)],
+            "semantic_chunks": [{"path": f"component-{index}.groovy", "start_line": 1, "end_line": 1, "file_type": ".groovy", "text": "InternalThing " * 500} for index in range(10)],
+        }
+        batches = ai_review_batches(report, max_bytes=10_000)
+        self.assertGreater(len(batches), 1)
+        self.assertTrue(all(json_size(batch) <= 10_000 for batch in batches))
+        self.assertEqual(30, sum(len(batch["candidate_inventory"]) for batch in batches))
+        self.assertEqual(10, sum(len(batch["semantic_chunks"]) for batch in batches))
 
     def test_import_review_approve_all_affects_only_touched_entries(self):
         fingerprint = initial_fingerprint()

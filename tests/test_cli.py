@@ -103,8 +103,13 @@ class CliTests(unittest.TestCase):
 
             self.assertEqual(0, main(["prepare", str(source), "--workspace", str(workspace)]))
             self.assertTrue((workspace / "fingerprint.json").exists())
-            self.assertTrue((workspace / "internal-ai-review-request.json").exists())
-            (workspace / "internal-ai-review-response.json").write_text(json.dumps({"entries": [{"canonical": "Orion", "category": "project", "variants": ["Orion"], "confidence": "high", "rationale": "Internal project name", "evidence": [{"path": "orion.yml", "line": 1}]}]}), encoding="utf-8")
+            index = json.loads((workspace / "internal-ai-review" / "index.json").read_text(encoding="utf-8"))
+            self.assertEqual(1, len(index["batches"]))
+            batch = index["batches"][0]
+            self.assertTrue((workspace / "internal-ai-review" / "batches" / batch["request_file"]).exists())
+            response = {"batch_id": batch["batch_id"], "batch_digest": batch["batch_digest"], "entries": [{"canonical": "Orion", "category": "project", "variants": ["Orion"], "confidence": "high", "rationale": "Internal project name", "evidence": [{"path": "orion.yml", "line": 1}]}]}
+            (workspace / "internal-ai-review" / "responses" / batch["response_file"]).parent.mkdir(parents=True)
+            (workspace / "internal-ai-review" / "responses" / batch["response_file"]).write_text(json.dumps(response), encoding="utf-8")
 
             with patch("deidentify.cli.getpass.getpass", side_effect=["correct horse battery staple", "correct horse battery staple"]):
                 self.assertEqual(0, main(["package", str(source), "--workspace", str(workspace)]))

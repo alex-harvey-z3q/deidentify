@@ -31,8 +31,10 @@ This is the intended default for teams that already run secret/PII/DLP gates and
 python -m pip install -e .
 
 deidentify prepare /path/to/project --workspace /secure/deidentify-work
-# Send only /secure/deidentify-work/internal-ai-review-request.json to the sanctioned internal AI.
-# Save its JSON response as /secure/deidentify-work/internal-ai-review-response.json.
+# Open /secure/deidentify-work/internal-ai-review/index.json.
+# Attach every JSON file in its batches/ directory to sanctioned internal Copilot Chat, one at a time.
+# Each batch contains its own prompt: return only its required JSON response.
+# Save every response using the same filename in internal-ai-review/responses/.
 deidentify package /path/to/project --workspace /secure/deidentify-work
 
 # After ChatGPT returns a modified tarball, restore it only in an approved local environment.
@@ -40,7 +42,7 @@ deidentify reidentify returned-from-chatgpt.tar.gz /secure/deidentify-work/proje
   restored-internal.tar.gz
 ```
 
-`prepare` creates or reuses `fingerprint.json` in the workspace, scans the source, and writes the bounded review request. `package` imports the saved response, approves exactly the entries touched by that response, then builds an archive and an encrypted mapping vault. It prompts for the vault passphrase. Its default `--unsupported-policy exclude` omits non-text files rather than blocking the bundle; omissions are recorded in the manifest. Use `--unsupported-policy reject` when completeness matters more than convenience.
+`prepare` creates or reuses `fingerprint.json` in the workspace, scans the source, and writes size-bounded Copilot review batches. The default maximum is 200,000 serialized bytes per batch; change it with `--review-batch-bytes` if your sanctioned Copilot environment has a lower attachment/context limit. Every batch includes its own provider-neutral prompt, response schema, `batch_id`, and digest. `package` requires a matching JSON response for every batch, verifies each identity and digest, imports their combined entries, approves exactly the entries touched by those responses, then builds an archive and encrypted mapping vault. It prompts for the vault passphrase. Its default `--unsupported-policy exclude` omits non-text files rather than blocking the bundle; omissions are recorded in the manifest. Use `--unsupported-policy reject` when completeness matters more than convenience.
 
 The workspace is sensitive: it holds the accumulated organisation fingerprint, the AI review artifacts, and the encrypted vault. Keep it outside the repository and in an access-controlled location. `package --no-mapping-vault` is available only when reidentification is not needed.
 
@@ -62,7 +64,7 @@ Each exact approved spelling/case variant receives its own token, so reidentific
 
 Static discovery ranks candidates from paths and file contents, retaining whether evidence is path- or content-based. It checks domains, URLs, email addresses/domains, IP addresses, UUIDs, AWS ARNs, Azure resource identifiers, proper names, PascalCase, lowerCamelCase, snake_case, uppercase identifiers, and kebab-case identifiers. Candidates are not declarations of sensitivity.
 
-The AI review artifact includes a candidate inventory and at most 200 short source snippets. The bounded context helps discover aliases, codenames, naming conventions, and business context without sending the entire repository in one request.
+The AI review artifacts contain a compact candidate inventory and at most 200 short source snippets. They are partitioned by serialized byte size, not a fragile item count, so each Copilot request is independently reviewable. The bounded context helps discover aliases, codenames, naming conventions, and business context without sending the entire repository in one request.
 
 Fingerprint states are:
 

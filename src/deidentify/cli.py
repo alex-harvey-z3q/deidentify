@@ -5,7 +5,7 @@ import getpass
 import sys
 from pathlib import Path
 
-from .engine import ai_review_request, approve_candidates, audit_request, audit_review_template, build, import_review, initial_fingerprint, load_json, preview, reidentify, require_outside_source, scan, validate_fingerprint, write_json
+from .engine import DEFAULT_REVIEW_BATCH_BYTES, ai_review_batches, ai_review_request, approve_candidates, audit_request, audit_review_template, build, import_review, initial_fingerprint, load_json, merge_review_batch_responses, preview, reidentify, require_outside_source, scan, validate_fingerprint, write_json
 
 
 def require_workflow_artifacts_outside_source(source: Path, **artifacts: Path | None) -> None:
@@ -27,6 +27,10 @@ def workspace_paths(workspace: Path, source: Path) -> dict[str, Path]:
         "report": workspace / "scan-report.json",
         "request": workspace / "internal-ai-review-request.json",
         "review": workspace / "internal-ai-review-response.json",
+        "review_directory": workspace / "internal-ai-review",
+        "review_index": workspace / "internal-ai-review" / "index.json",
+        "review_batches": workspace / "internal-ai-review" / "batches",
+        "review_responses": workspace / "internal-ai-review" / "responses",
         "archive": workspace / bundle_name,
         "vault": workspace / f"{bundle_name}.mapping.vault.json",
     }
@@ -56,6 +60,7 @@ def parser() -> argparse.ArgumentParser:
     prepare_cmd = commands.add_parser("prepare", help="Start the short workflow: create/update a workspace and write one internal-AI review request.")
     prepare_cmd.add_argument("source", type=Path)
     prepare_cmd.add_argument("--workspace", type=Path, required=True, help="Secure directory outside the source for the fingerprint and workflow artifacts.")
+    prepare_cmd.add_argument("--review-batch-bytes", type=int, default=DEFAULT_REVIEW_BATCH_BYTES, help=f"Maximum serialized bytes per Copilot review batch (default: {DEFAULT_REVIEW_BATCH_BYTES}).")
     review = commands.add_parser("import-review", help="Import unapproved entries proposed by sanctioned internal AI.")
     review.add_argument("source", type=Path)
     review.add_argument("fingerprint", type=Path)
@@ -77,7 +82,8 @@ def parser() -> argparse.ArgumentParser:
     package_cmd = commands.add_parser("package", help="Finish the short workflow: import and approve this AI review, then build a reversible bundle.")
     package_cmd.add_argument("source", type=Path)
     package_cmd.add_argument("--workspace", type=Path, required=True, help="Workspace previously created by prepare.")
-    package_cmd.add_argument("--review", type=Path, help="Internal-AI response JSON; defaults to WORKSPACE/internal-ai-review-response.json.")
+    package_cmd.add_argument("--review", type=Path, help="Legacy single internal-AI response JSON; otherwise package reads all verified Copilot batch responses.")
+    package_cmd.add_argument("--review-responses", type=Path, help="Directory containing the Copilot batch response JSON files.")
     package_cmd.add_argument("--output", type=Path, help="Archive output; defaults inside the workspace.")
     package_cmd.add_argument("--mapping-vault", type=Path, help="Encrypted reverse map; defaults inside the workspace.")
     package_cmd.add_argument("--no-mapping-vault", action="store_true", help="Do not create a reverse map; reidentification will not be possible.")
@@ -130,10 +136,17 @@ def main(argv: list[str] | None = None) -> int:
                 write_json(paths["fingerprint"], initial_fingerprint())
             report = scan(source=args.source)
             write_json(paths["report"], report)
-            write_json(paths["request"], ai_review_request(report))
+            batches = ai_review_batches(report, args.review_batch_bytes)
+            index_batches = []
+            for batch in batches:
+                filename = f"{batch['batch_id']}.json"
+                write_json(paths["review_batches"] / filename, batch)
+                index_batches.append({"batch_id": batch["batch_id"], "batch_digest": batch["batch_digest"], "request_file": filename, "response_file": filename})
+            write_json(paths["review_index"], {"schema_version": 1, "purpose": "Copilot review batch index. Attach every file in batches/ to sanctioned internal Copilot and save the JSON-only response using the same filename in responses/.", "batches": index_batches})
             print(f"Prepared workspace: {args.workspace}")
-            print(f"Internal-AI review request: {paths['request']}")
-            print("Save the internal-AI response as: " + str(paths["review"]))
+            print(f"Copilot review index: {paths['review_index']}")
+            print(f"Copilot review batches: {paths['review_batches']} ({len(batches)} files, at most {args.review_batch_bytes} bytes each)")
+            print("Save each JSON-only Copilot response using the same filename in: " + str(paths["review_responses"]))
         elif args.command == "import-review":
             require_workflow_artifacts_outside_source(args.source, fingerprint=args.fingerprint, ai_review_response=args.review)
             fingerprint = load_json(args.fingerprint)
@@ -171,12 +184,16 @@ def main(argv: list[str] | None = None) -> int:
             paths = workspace_paths(args.workspace, args.source)
             if args.no_mapping_vault and args.mapping_vault:
                 raise ValueError("--no-mapping-vault cannot be combined with --mapping-vault")
-            review_path = args.review or paths["review"]
+            if args.review and args.review_responses:
+                raise ValueError("--review cannot be combined with --review-responses")
+            review_path = args.review
+            responses_directory = args.review_responses or paths["review_responses"]
             output = args.output or paths["archive"]
             vault_path = None if args.no_mapping_vault else (args.mapping_vault or paths["vault"])
-            require_workflow_artifacts_outside_source(args.source, fingerprint=paths["fingerprint"], ai_review_response=review_path, archive_output=output, mapping_vault=vault_path)
+            require_workflow_artifacts_outside_source(args.source, fingerprint=paths["fingerprint"], ai_review_response=review_path, copilot_review_responses=responses_directory, archive_output=output, mapping_vault=vault_path)
             vault_passphrase = mapping_vault_passphrase() if vault_path else None
-            fingerprint, added, updated, approved = import_review(load_json(paths["fingerprint"]), load_json(review_path), approve_all=True)
+            review = load_json(review_path) if review_path else merge_review_batch_responses(load_json(paths["review_index"]), responses_directory)
+            fingerprint, added, updated, approved = import_review(load_json(paths["fingerprint"]), review, approve_all=True)
             write_json(paths["fingerprint"], fingerprint)
             manifest = build(args.source, fingerprint, output, unsupported_policy=args.unsupported_policy, vault_path=vault_path, vault_passphrase=vault_passphrase)
             print(f"Imported review: {added} entries added, {updated} entries updated; approved {approved} touched entries.")

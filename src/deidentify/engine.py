@@ -20,12 +20,14 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 
-VERSION = "0.4.1"
+VERSION = "0.5.0"
 WINDOWS_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 DEFAULT_EXCLUDED_DIRS = {".git", ".hg", ".svn", "node_modules", "vendor", "dist", "build", ".venv", "venv", "__pycache__"}
 DEFAULT_EXCLUDED_FILE_NAMES = {".env", ".envrc", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"}
 GENERIC_PATH_COMPONENTS = {"src", "test", "tests", "docs", "doc", "main", "config", "configs", "assets", "scripts", "lib", "app", "api", "service", "services", "terraform"}
 MAX_FILE_BYTES = 2_000_000
+DEFAULT_REVIEW_BATCH_BYTES = 200_000
+MAX_REVIEW_SNIPPET_BYTES = 6_000
 DOMAIN_RE = re.compile(r"(?<![@\w-])(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}(?![\w-])")
 URL_RE = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
 EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,63}\b")
@@ -241,6 +243,81 @@ def scan(source: Path) -> dict[str, Any]:
 
 def ai_review_request(report: dict[str, Any]) -> dict[str, Any]:
     return {"schema_version": 1, "purpose": "Internal-only organisation fingerprint discovery; proposals remain candidates and cannot approve replacements.", "instructions": "Review the bounded snippets and candidate inventory. Discover employer/company, customer, project/program, internal product/system, hostname/domain, repository organisation, cloud tenant/account, alias, acronym, or meaningful identifier that could fingerprint the source. Return only response_schema JSON. Do not transform content, approve entries, or invent evidence.", "candidate_inventory": report["candidate_inventory"], "semantic_chunks": report["semantic_chunks"], "response_schema": {"entries": [{"canonical": "string", "category": "company|internal_product|customer|internal_system|project|other", "variants": ["string"], "confidence": "low|medium|high", "rationale": "string", "evidence": [{"path": "string", "line": 1}]}]}}
+
+
+def json_size(value: Any) -> int:
+    """Measure the exact pretty-printed JSON representation written by write_json."""
+    return len((json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+
+
+def compact_review_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in candidate.items() if key != "evidence"} | {"evidence": candidate.get("evidence", [])[:2]}
+
+
+def compact_review_chunk(chunk: dict[str, Any]) -> dict[str, Any]:
+    result = dict(chunk)
+    encoded = result["text"].encode("utf-8")
+    if len(encoded) > MAX_REVIEW_SNIPPET_BYTES:
+        result["text"] = encoded[:MAX_REVIEW_SNIPPET_BYTES].decode("utf-8", errors="ignore") + "\n[truncated]"
+    return result
+
+
+def review_batch_payload(batch_id: str, candidates: list[dict[str, Any]], chunks: list[dict[str, Any]]) -> dict[str, Any]:
+    payload = {
+        "schema_version": 1,
+        "batch_id": batch_id,
+        "purpose": "Internal-only organisation fingerprint discovery. Return only response_schema JSON; do not transform content, approve entries, or invent evidence.",
+        "instructions": "Review only this batch. Identify employer/company, customer, project/program, internal product/system, hostname/domain, repository organisation, cloud tenant/account, alias, acronym, or meaningful identifier that could fingerprint the source. Echo batch_id and batch_digest exactly in your response.",
+        "candidate_inventory": candidates,
+        "semantic_chunks": chunks,
+        "response_schema": {"batch_id": batch_id, "batch_digest": "sha256:<hex>", "entries": [{"canonical": "string", "category": "company|internal_product|customer|internal_system|project|other", "variants": ["string"], "confidence": "low|medium|high", "rationale": "string", "evidence": [{"path": "string", "line": 1}]}]},
+    }
+    payload["batch_digest"] = digest_json({key: value for key, value in payload.items() if key not in {"batch_digest", "response_schema"}})
+    return payload
+
+
+def ai_review_batches(report: dict[str, Any], max_bytes: int = DEFAULT_REVIEW_BATCH_BYTES) -> list[dict[str, Any]]:
+    """Partition AI-facing review context by serialized size, not a fragile item count."""
+    if max_bytes < 10_000:
+        raise ValueError("review batch size must be at least 10000 bytes")
+    records = [("candidate", compact_review_candidate(item)) for item in report["candidate_inventory"]]
+    records.extend(("chunk", compact_review_chunk(item)) for item in report["semantic_chunks"])
+    batches: list[dict[str, Any]] = []; candidates: list[dict[str, Any]] = []; chunks: list[dict[str, Any]] = []
+    for kind, record in records:
+        target = candidates if kind == "candidate" else chunks
+        target.append(record)
+        candidate_id = f"review-{len(batches) + 1:03d}"
+        payload = review_batch_payload(candidate_id, candidates, chunks)
+        if json_size(payload) <= max_bytes:
+            continue
+        target.pop()
+        if not candidates and not chunks:
+            raise ValueError(f"Review item exceeds the configured batch size of {max_bytes} bytes")
+        batches.append(review_batch_payload(candidate_id, candidates, chunks))
+        candidates, chunks = ([record], []) if kind == "candidate" else ([], [record])
+        if json_size(review_batch_payload(f"review-{len(batches) + 1:03d}", candidates, chunks)) > max_bytes:
+            raise ValueError(f"Review item exceeds the configured batch size of {max_bytes} bytes")
+    if candidates or chunks:
+        batches.append(review_batch_payload(f"review-{len(batches) + 1:03d}", candidates, chunks))
+    return batches
+
+
+def merge_review_batch_responses(index: dict[str, Any], responses_directory: Path) -> dict[str, Any]:
+    batches = index.get("batches")
+    if index.get("schema_version") != 1 or not isinstance(batches, list) or not batches:
+        raise ValueError("Invalid internal-AI review index")
+    entries: list[dict[str, Any]] = []
+    for batch in batches:
+        if not isinstance(batch, dict) or not all(isinstance(batch.get(key), str) for key in ("batch_id", "batch_digest", "response_file")):
+            raise ValueError("Invalid internal-AI review index batch")
+        response_path = responses_directory / batch["response_file"]
+        response = load_json(response_path)
+        if response.get("batch_id") != batch["batch_id"] or response.get("batch_digest") != batch["batch_digest"]:
+            raise ValueError(f"Internal-AI response does not match batch {batch['batch_id']}: {response_path}")
+        if not isinstance(response.get("entries"), list):
+            raise ValueError(f"Internal-AI response entries must be a list: {response_path}")
+        entries.extend(response["entries"])
+    return {"entries": entries}
 
 
 def import_review(fingerprint: dict[str, Any], review: dict[str, Any], approve_all: bool = False) -> tuple[dict[str, Any], int, int, int]:
