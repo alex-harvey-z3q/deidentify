@@ -6,7 +6,7 @@ import shlex
 import sys
 from pathlib import Path
 
-from .engine import DEFAULT_REVIEW_BATCH_BYTES, ai_review_batches, ai_review_request, approve_candidates, audit_request, audit_review_template, build, candidate_summary, import_review, initial_fingerprint, load_json, merge_review_batch_responses, preview, reidentify, require_outside_source, review_from_candidate_summary, scan, validate_fingerprint, write_json
+from .engine import DEFAULT_REVIEW_BATCH_BYTES, ai_review_batches, ai_review_request, approve_candidates, audit_request, audit_review_template, build, candidate_summary, import_review, initial_fingerprint, load_json, merge_review_batch_responses, preview, preview_check, rebase_fingerprint, reidentify, require_outside_source, review_from_candidate_summary, scan, validate_fingerprint, write_json
 
 
 def require_workflow_artifacts_outside_source(source: Path, **artifacts: Path | None) -> None:
@@ -78,6 +78,11 @@ def parser() -> argparse.ArgumentParser:
     candidates_import.add_argument("scan_report", type=Path)
     candidates_import.add_argument("candidate_summary", type=Path)
     candidates_import.add_argument("--approve-all", action="store_true", help="Explicitly approve only entries selected by this local candidate summary.")
+    fingerprint_cmd = commands.add_parser("fingerprint", help="Manage fingerprint source binding.")
+    fingerprint = fingerprint_cmd.add_subparsers(dest="fingerprint_command", required=True)
+    rebase_cmd = fingerprint.add_parser("rebase", help="Explicitly bind an existing fingerprint to the current source tree.")
+    rebase_cmd.add_argument("source", type=Path)
+    rebase_cmd.add_argument("fingerprint", type=Path)
     prepare_cmd = commands.add_parser("prepare", help="Start the short workflow: create/update a workspace and write one internal-AI review request.")
     prepare_cmd.add_argument("source", type=Path)
     prepare_cmd.add_argument("--workspace", type=Path, required=True, help="Secure directory outside the source for the fingerprint and workflow artifacts.")
@@ -114,6 +119,10 @@ def parser() -> argparse.ArgumentParser:
     preview_cmd.add_argument("fingerprint", type=Path)
     preview_cmd.add_argument("--output", type=Path, required=True)
     preview_cmd.add_argument("--unsupported-policy", choices=("reject", "exclude"), default="reject")
+    preview_check_cmd = commands.add_parser("preview-check", help="Verify that a preview artifact still matches its source and fingerprint.")
+    preview_check_cmd.add_argument("source", type=Path)
+    preview_check_cmd.add_argument("fingerprint", type=Path)
+    preview_check_cmd.add_argument("preview", type=Path)
     audit_cmd = commands.add_parser("audit-request", help="Create a bounded adversarial audit request from staged content.")
     audit_cmd.add_argument("source", type=Path)
     audit_cmd.add_argument("fingerprint", type=Path)
@@ -138,7 +147,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "init":
             if args.fingerprint.exists():
                 raise ValueError(f"Refusing to overwrite existing file: {args.fingerprint}")
-            write_json(args.fingerprint, initial_fingerprint())
+            write_json(args.fingerprint, initial_fingerprint(args.source))
             print(f"Created fingerprint: {args.fingerprint}")
         elif args.command == "scan":
             require_workflow_artifacts_outside_source(args.source, scan_report=args.report, ai_review_request=args.ai_review_request, candidate_summary=args.candidate_summary)
@@ -150,6 +159,10 @@ def main(argv: list[str] | None = None) -> int:
                 args.candidate_summary.parent.mkdir(parents=True, exist_ok=True)
                 args.candidate_summary.write_text(candidate_summary(report), encoding="utf-8")
             print(f"Scanned {report['source']['scanned_file_count']} text files; found {len(report['candidate_inventory'])} candidate groups.")
+            print(f"Source: {report['source']['path']}")
+            print(f"Text files scanned: {report['source']['scanned_file_count']}")
+            print(f"Top-level files: {report['source']['top_level_file_count']}")
+            print(f"Top-level directories: {report['source']['top_level_directory_count']}")
             print(f"Report: {args.report}")
             if args.ai_review_request:
                 print(f"Internal-AI review request: {args.ai_review_request}")
@@ -181,13 +194,20 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"Approved {approved} imported/updated entries.")
                 else:
                     print("Selected entries remain candidates. Re-run with --approve-all to explicitly approve them.")
+        elif args.command == "fingerprint":
+            if args.fingerprint_command == "rebase":
+                require_workflow_artifacts_outside_source(args.source, fingerprint=args.fingerprint)
+                fingerprint, presence = rebase_fingerprint(args.source, load_json(args.fingerprint))
+                write_json(args.fingerprint, fingerprint)
+                print(f"Fingerprint rebound to source tree: {fingerprint['source_tree_digest']}")
+                print(f"Approved entries present: {presence['present']}; absent: {presence['absent']}; newly present: {presence['became_present']}; newly absent: {presence['became_absent']}")
         elif args.command == "prepare":
             paths = workspace_paths(args.workspace, args.source)
             if paths["fingerprint"].exists():
                 fingerprint = load_json(paths["fingerprint"])
                 validate_fingerprint(fingerprint)
             else:
-                write_json(paths["fingerprint"], initial_fingerprint())
+                write_json(paths["fingerprint"], initial_fingerprint(args.source))
             report = scan(source=args.source)
             write_json(paths["report"], report)
             batches = ai_review_batches(report, args.review_batch_bytes)
@@ -229,7 +249,12 @@ def main(argv: list[str] | None = None) -> int:
             manifest = build(args.source, fingerprint, args.output, unsupported_policy=args.unsupported_policy, audit=audit, audit_review=audit_review, fail_on_ai_findings=args.fail_on_ai_findings, vault_path=args.mapping_vault, vault_passphrase=vault_passphrase)
             print(f"Created archive: {args.output}")
             print(f"Manifest: {args.output.with_suffix(args.output.suffix + '.manifest.json')}")
+            print(f"Approved fingerprint entries: {manifest['fingerprint']['approved_entry_count']}")
             print(f"Applied {manifest['fingerprint']['entries_applied']} approved fingerprint entries.")
+            print(f"Directly applied: {manifest['fingerprint']['directly_applied']}")
+            print(f"Satisfied by overlap: {manifest['fingerprint']['satisfied_by_overlap']}")
+            print(f"Not present: {manifest['fingerprint']['not_present']}")
+            print(f"Unresolved: {manifest['fingerprint']['unresolved']}")
             print("Approved variants remaining: 0")
             if manifest["omitted_files"]:
                 print(f"Warning: {len(manifest['omitted_files'])} files/directories were omitted by policy.")
@@ -254,6 +279,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Imported review: {added} entries added, {updated} entries updated; approved {approved} touched entries.")
             print(f"Created archive: {output}")
             print(f"Manifest: {output.with_suffix(output.suffix + '.manifest.json')}")
+            print(f"Approved fingerprint entries: {manifest['fingerprint']['approved_entry_count']}")
+            print(f"Applied {manifest['fingerprint']['entries_applied']} approved fingerprint entries.")
+            print(f"Directly applied: {manifest['fingerprint']['directly_applied']}")
+            print(f"Satisfied by overlap: {manifest['fingerprint']['satisfied_by_overlap']}")
+            print(f"Not present: {manifest['fingerprint']['not_present']}")
+            print(f"Unresolved: {manifest['fingerprint']['unresolved']}")
             print("Approved variants remaining: 0")
             if manifest["omitted_files"]:
                 print(f"Warning: {len(manifest['omitted_files'])} files/directories were omitted by policy.")
@@ -264,6 +295,10 @@ def main(argv: list[str] | None = None) -> int:
             fingerprint = load_json(args.fingerprint)
             write_json(args.output, preview(source=args.source, fingerprint=fingerprint, unsupported_policy=args.unsupported_policy))
             print(f"Preview: {args.output}")
+        elif args.command == "preview-check":
+            require_workflow_artifacts_outside_source(args.source, fingerprint=args.fingerprint, preview_artifact=args.preview)
+            preview_check(args.source, load_json(args.fingerprint), load_json(args.preview))
+            print("Preview current: yes")
         elif args.command == "audit-request":
             require_workflow_artifacts_outside_source(args.source, fingerprint=args.fingerprint, audit_request=args.output)
             fingerprint = load_json(args.fingerprint)

@@ -20,7 +20,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 
-VERSION = "0.5.1"
+VERSION = "0.6.0"
 WINDOWS_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 DEFAULT_EXCLUDED_DIRS = {".git", ".hg", ".svn", "node_modules", "vendor", "dist", "build", ".venv", "venv", "__pycache__"}
 DEFAULT_EXCLUDED_FILE_NAMES = {".env", ".envrc", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"}
@@ -65,8 +65,68 @@ def write_json(path: Path, value: dict[str, Any]) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def initial_fingerprint() -> dict[str, Any]:
-    return {"schema_version": 1, "created_at": utc_now(), "entries": []}
+def source_tree_digest(source: Path) -> str:
+    """Digest the logical text tree, independent of location and traversal order."""
+    root = source_root(source); entries = []
+    for full_path, relative, reason in iter_source_files(root):
+        if reason:
+            continue
+        text, reason = read_text_file(root, full_path)
+        if reason:
+            continue
+        entries.append({"path": relative.as_posix(), "content_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()})
+    encoded = json.dumps(sorted(entries, key=lambda item: item["path"]), separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def fingerprint_digest(fingerprint: dict[str, Any]) -> str:
+    entries = validate_fingerprint(fingerprint)
+    security_entries = [{"canonical": entry["canonical"], "category": entry["category"], "variants": sorted(entry["variants"]), "status": entry["status"], "approval": entry.get("approval")} for entry in entries]
+    value = {"source_tree_digest": fingerprint.get("source_tree_digest"), "entries": sorted(security_entries, key=lambda entry: entry["canonical"].casefold())}
+    return "sha256:" + hashlib.sha256(json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def initial_fingerprint(source: Path | None = None) -> dict[str, Any]:
+    fingerprint = {"schema_version": 1, "created_at": utc_now(), "entries": []}
+    if source is not None:
+        fingerprint["source_tree_digest"] = source_tree_digest(source)
+    return fingerprint
+
+
+def require_fingerprint_source(source: Path, fingerprint: dict[str, Any]) -> str:
+    expected = fingerprint.get("source_tree_digest")
+    if expected is None:  # Legacy programmatic fingerprints remain usable; CLI-created fingerprints are bound.
+        return source_tree_digest(source)
+    current = source_tree_digest(source)
+    if expected != current:
+        raise ValueError(f"Fingerprint does not correspond to the current source tree.\n\nExpected: {expected}\nCurrent:  {current}\n\nRe-scan or explicitly rebase the fingerprint.")
+    return current
+
+
+def approved_entry_presence(source: Path, fingerprint: dict[str, Any]) -> dict[str, bool]:
+    root = source_root(source)
+    corpus: list[tuple[str, str]] = []
+    for full_path, relative, reason in iter_source_files(root):
+        if reason:
+            continue
+        text, reason = read_text_file(root, full_path)
+        if text is not None and reason is None:
+            corpus.append((relative.as_posix(), text))
+    return {entry["canonical"]: any(re.search(re.escape(variant), path) or re.search(re.escape(variant), text) for variant in entry["variants"] for path, text in corpus) for entry in validate_fingerprint(fingerprint) if entry["status"] == "approved"}
+
+
+def rebase_fingerprint(source: Path, fingerprint: dict[str, Any]) -> tuple[dict[str, Any], dict[str, int]]:
+    validate_fingerprint(fingerprint)
+    previous = fingerprint.get("source_tree_digest")
+    current = source_tree_digest(source)
+    previous_presence = fingerprint.get("approved_entry_presence", {})
+    current_presence = approved_entry_presence(source, fingerprint)
+    changes = {"became_present": sum(not previous_presence.get(name, current_presence[name]) and current_presence[name] for name in current_presence), "became_absent": sum(previous_presence.get(name, current_presence[name]) and not current_presence[name] for name in current_presence), "present": sum(current_presence.values()), "absent": sum(not value for value in current_presence.values())}
+    fingerprint["source_tree_digest"] = current
+    fingerprint["approved_entry_presence"] = current_presence
+    fingerprint.setdefault("source_rebases", []).append({"from": previous, "to": current, "presence": changes, "rebased_at": utc_now()})
+    fingerprint["updated_at"] = utc_now()
+    return fingerprint, changes
 
 
 def validate_fingerprint(fingerprint: dict[str, Any]) -> list[dict[str, Any]]:
@@ -238,11 +298,12 @@ def scan(source: Path) -> dict[str, Any]:
     for candidate in candidates: grouped[(candidate["term"].casefold(), candidate["kind"])].append(candidate)
     inventory = [{"term": values[0]["term"], "kind": kind, "score": max(v["score"] for v in values) + min(len(values), 10), "occurrences": len(values), "evidence": [{"source": v["source"], "path": v["path"], **({"line": v["line"]} if "line" in v else {})} for v in values[:5]]} for (_, kind), values in grouped.items()]
     inventory.sort(key=lambda item: (-item["score"], -item["occurrences"], item["term"].casefold()))
-    return {"schema_version": 2, "tool_version": VERSION, "created_at": utc_now(), "source": {"path": str(root), "scanned_file_count": scanned_files}, "candidate_inventory": inventory, "semantic_chunks": chunks[:200], "excluded_files": excluded}
+    top_level = list(root.iterdir())
+    return {"schema_version": 2, "tool_version": VERSION, "created_at": utc_now(), "source": {"path": str(root), "tree_digest": source_tree_digest(root), "scanned_file_count": scanned_files, "top_level_file_count": sum(item.is_file() and not item.is_symlink() for item in top_level), "top_level_directory_count": sum(item.is_dir() and not item.is_symlink() for item in top_level)}, "candidate_inventory": inventory, "semantic_chunks": chunks[:200], "excluded_files": excluded}
 
 
 def ai_review_request(report: dict[str, Any]) -> dict[str, Any]:
-    return {"schema_version": 1, "purpose": "Internal-only organisation fingerprint discovery; proposals remain candidates and cannot approve replacements.", "instructions": "Review the bounded snippets and candidate inventory. Discover employer/company, customer, project/program, internal product/system, hostname/domain, repository organisation, cloud tenant/account, alias, acronym, or meaningful identifier that could fingerprint the source. Return only response_schema JSON. Do not transform content, approve entries, or invent evidence.", "candidate_inventory": report["candidate_inventory"], "semantic_chunks": report["semantic_chunks"], "response_schema": {"entries": [{"canonical": "string", "category": "company|internal_product|customer|internal_system|project|other", "variants": ["string"], "confidence": "low|medium|high", "rationale": "string", "evidence": [{"path": "string", "line": 1}]}]}}
+    return {"schema_version": 1, "purpose": "Internal-only organisation fingerprint discovery; proposals remain candidates and cannot approve replacements.", "source_tree_digest": report["source"]["tree_digest"], "instructions": "Review the bounded snippets and candidate inventory. Discover employer/company, customer, project/program, internal product/system, hostname/domain, repository organisation, cloud tenant/account, alias, acronym, or meaningful identifier that could fingerprint the source. Return only response_schema JSON. Do not transform content, approve entries, or invent evidence.", "candidate_inventory": report["candidate_inventory"], "semantic_chunks": report["semantic_chunks"], "response_schema": {"entries": [{"canonical": "string", "category": "company|internal_product|customer|internal_system|project|other", "variants": ["string"], "confidence": "low|medium|high", "rationale": "string", "evidence": [{"path": "string", "line": 1}]}]}}
 
 
 def scan_report_digest(report: dict[str, Any]) -> str:
@@ -319,10 +380,11 @@ def compact_review_chunk(chunk: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def review_batch_payload(batch_id: str, candidates: list[dict[str, Any]], chunks: list[dict[str, Any]]) -> dict[str, Any]:
+def review_batch_payload(batch_id: str, source_digest: str, candidates: list[dict[str, Any]], chunks: list[dict[str, Any]]) -> dict[str, Any]:
     payload = {
         "schema_version": 1,
         "batch_id": batch_id,
+        "source_tree_digest": source_digest,
         "purpose": "Internal-only organisation fingerprint discovery. Return only response_schema JSON; do not transform content, approve entries, or invent evidence.",
         "instructions": "Review only this batch. Identify employer/company, customer, project/program, internal product/system, hostname/domain, repository organisation, cloud tenant/account, alias, acronym, or meaningful identifier that could fingerprint the source. Echo batch_id and batch_digest exactly in your response.",
         "candidate_inventory": candidates,
@@ -337,25 +399,34 @@ def ai_review_batches(report: dict[str, Any], max_bytes: int = DEFAULT_REVIEW_BA
     """Partition AI-facing review context by serialized size, not a fragile item count."""
     if max_bytes < 10_000:
         raise ValueError("review batch size must be at least 10000 bytes")
-    records = [("candidate", compact_review_candidate(item)) for item in report["candidate_inventory"]]
-    records.extend(("chunk", compact_review_chunk(item)) for item in report["semantic_chunks"])
+    chunks_by_path: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for chunk in report["semantic_chunks"]:
+        chunks_by_path[chunk["path"]].append(compact_review_chunk(chunk))
+    records: list[tuple[str, dict[str, Any]]] = []
+    for candidate in report["candidate_inventory"]:
+        records.append(("candidate", compact_review_candidate(candidate)))
+        evidence_paths = [evidence.get("path") for evidence in candidate.get("evidence", []) if isinstance(evidence, dict)]
+        for path in dict.fromkeys(path for path in evidence_paths if isinstance(path, str)):
+            records.extend(("chunk", chunk) for chunk in chunks_by_path.pop(path, []))
+    for path in sorted(chunks_by_path):
+        records.extend(("chunk", chunk) for chunk in chunks_by_path[path])
     batches: list[dict[str, Any]] = []; candidates: list[dict[str, Any]] = []; chunks: list[dict[str, Any]] = []
     for kind, record in records:
         target = candidates if kind == "candidate" else chunks
         target.append(record)
         candidate_id = f"review-{len(batches) + 1:03d}"
-        payload = review_batch_payload(candidate_id, candidates, chunks)
+        payload = review_batch_payload(candidate_id, report["source"]["tree_digest"], candidates, chunks)
         if json_size(payload) <= max_bytes:
             continue
         target.pop()
         if not candidates and not chunks:
             raise ValueError(f"Review item exceeds the configured batch size of {max_bytes} bytes")
-        batches.append(review_batch_payload(candidate_id, candidates, chunks))
+        batches.append(review_batch_payload(candidate_id, report["source"]["tree_digest"], candidates, chunks))
         candidates, chunks = ([record], []) if kind == "candidate" else ([], [record])
-        if json_size(review_batch_payload(f"review-{len(batches) + 1:03d}", candidates, chunks)) > max_bytes:
+        if json_size(review_batch_payload(f"review-{len(batches) + 1:03d}", report["source"]["tree_digest"], candidates, chunks)) > max_bytes:
             raise ValueError(f"Review item exceeds the configured batch size of {max_bytes} bytes")
     if candidates or chunks:
-        batches.append(review_batch_payload(f"review-{len(batches) + 1:03d}", candidates, chunks))
+        batches.append(review_batch_payload(f"review-{len(batches) + 1:03d}", report["source"]["tree_digest"], candidates, chunks))
     return batches
 
 
@@ -503,6 +574,35 @@ def build_plan(source: Path, fingerprint: dict[str, Any], unsupported_policy: st
     return plan, omitted, replacements
 
 
+def approved_entry_outcomes(fingerprint: dict[str, Any], plan: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Account for every approved entry without leaking entry names into manifests."""
+    approved = [entry for entry in validate_fingerprint(fingerprint) if entry["status"] == "approved"]
+    original = [(item["relative"].as_posix(), item["original_text"]) for item in plan]
+    transformed = [(item["target"].as_posix(), item["text"]) for item in plan]
+    directly_applied = {canonical for item in plan for canonical in item["applied"]}
+    outcomes = []
+    for entry in approved:
+        variants = entry["variants"]
+        present = any(re.search(re.escape(variant), path) or re.search(re.escape(variant), text) for variant in variants for path, text in original)
+        remaining = any(re.search(re.escape(variant), path) or re.search(re.escape(variant), text) for variant in variants for path, text in transformed)
+        if not present:
+            outcome = "not_present"; satisfied_by = []
+        elif entry["canonical"] in directly_applied:
+            outcome = "directly_applied"; satisfied_by = []
+        elif remaining:
+            outcome = "unresolved"; satisfied_by = []
+        else:
+            outcome = "satisfied_by_overlap"
+            satisfied_by = sorted({other for variant, _, other in approved_replacements(fingerprint) if other in directly_applied and other != entry["canonical"] and any(variant != own and own in variant for own in variants)})
+        outcomes.append({"canonical": entry["canonical"], "outcome": outcome, "satisfied_by": satisfied_by})
+    return outcomes
+
+
+def outcome_summary(outcomes: list[dict[str, Any]]) -> dict[str, int]:
+    counts = Counter(item["outcome"] for item in outcomes)
+    return {key: counts[key] for key in ("directly_applied", "satisfied_by_overlap", "not_present", "unresolved")}
+
+
 def short_variant_risks(fingerprint: dict[str, Any], plan: list[dict[str, Any]]) -> list[dict[str, Any]]:
     risks = []
     for entry in validate_fingerprint(fingerprint):
@@ -521,9 +621,23 @@ def short_variant_risks(fingerprint: dict[str, Any], plan: list[dict[str, Any]])
 
 
 def preview(source: Path, fingerprint: dict[str, Any], unsupported_policy: str = "reject") -> dict[str, Any]:
+    source_digest = require_fingerprint_source(source, fingerprint)
     plan, omitted, _ = build_plan(source, fingerprint, unsupported_policy)
     changes = [{"source_path": item["relative"].as_posix(), "output_path": item["target"].as_posix(), "path_changed": item["relative"] != item["target"], "content_changed": bool(item["content_occurrences"]), "occurrences": item["path_occurrences"] + item["content_occurrences"], "fingerprint_entries": sorted(item["applied"])} for item in plan if item["path_occurrences"] or item["content_occurrences"]]
-    return {"schema_version": 2, "created_at": utc_now(), "tree_digest": tree_digest(plan), "changes": changes, "short_variant_risks": short_variant_risks(fingerprint, plan), "omitted_files": omitted, "output_file_count": len(plan)}
+    transformed_digest = tree_digest(plan)
+    return {"schema_version": 3, "created_at": utc_now(), "source_tree_digest": source_digest, "fingerprint_digest": fingerprint_digest(fingerprint), "transformed_tree_digest": transformed_digest, "tree_digest": transformed_digest, "changes": changes, "short_variant_risks": short_variant_risks(fingerprint, plan), "approved_entry_outcomes": outcome_summary(approved_entry_outcomes(fingerprint, plan)), "omitted_files": omitted, "output_file_count": len(plan)}
+
+
+def preview_check(source: Path, fingerprint: dict[str, Any], preview_artifact: dict[str, Any]) -> None:
+    current_source = source_tree_digest(source)
+    if preview_artifact.get("source_tree_digest") != current_source:
+        raise ValueError("Preview is stale: source tree changed")
+    current_fingerprint = fingerprint_digest(fingerprint)
+    if preview_artifact.get("fingerprint_digest") != current_fingerprint:
+        raise ValueError("Preview is stale: fingerprint changed")
+    plan, _, _ = build_plan(source, fingerprint)
+    if preview_artifact.get("transformed_tree_digest") != tree_digest(plan):
+        raise ValueError("Preview is stale: transformed tree changed")
 
 
 def remaining_approved(text: str, replacements: list[tuple[str, str, str]]) -> set[str]:
@@ -609,7 +723,10 @@ def build(source: Path, fingerprint: dict[str, Any], output: Path, unsupported_p
     require_outside_source(source, output, "Archive output")
     if output.exists() or output.with_suffix(output.suffix + ".manifest.json").exists():
         raise ValueError("Refusing to overwrite an existing archive or manifest")
+    source_digest = require_fingerprint_source(source, fingerprint)
+    current_fingerprint_digest = fingerprint_digest(fingerprint)
     plan, omitted, replacements = build_plan(source, fingerprint, unsupported_policy)
+    outcomes = outcome_summary(approved_entry_outcomes(fingerprint, plan))
     short_risks = short_variant_risks(fingerprint, plan)
     audit_request_for_build = audit_request(source, fingerprint, unsupported_policy) if audit is not None else None
     substantive = substantive_audit_findings(audit, audit_request_for_build, audit_review) if audit is not None and audit_request_for_build else []
@@ -629,7 +746,7 @@ def build(source: Path, fingerprint: dict[str, Any], output: Path, unsupported_p
                 destination = staging / item["target"]; info = archive.gettarinfo(str(destination), arcname=item["target"].as_posix()); info.uid = info.gid = 0; info.uname = info.gname = ""; info.mtime = 0
                 with destination.open("rb") as stream: archive.addfile(info, stream)
     checksum = hashlib.sha256(output.read_bytes()).hexdigest()
-    manifest = {"schema_version": 3, "tool_version": VERSION, "created_at": utc_now(), "tree_digest": release_digest, "archive": {"filename": output.name, "sha256": checksum, "file_count": len(plan), "metadata_normalised": True}, "fingerprint": {"approved_entry_count": sum(e["status"] == "approved" for e in fingerprint["entries"]), "entries_applied": len({name for item in plan for name in item["applied"]})}, "short_variant_risks": short_risks, "omitted_files": omitted, "final_check": {"passed": True, "unresolved_approved_variants": 0, "paths_checked": True}, "ai_audit": {"performed": audit is not None, "tree_digest": release_digest if audit is not None else None, "open_medium_or_high_findings": len(substantive)}, "notes": ["No original-to-replacement map is stored in this manifest."]}
+    manifest = {"schema_version": 4, "tool_version": VERSION, "created_at": utc_now(), "source_tree_digest": source_digest, "fingerprint_digest": current_fingerprint_digest, "transformed_tree_digest": release_digest, "tree_digest": release_digest, "archive": {"filename": output.name, "sha256": checksum, "file_count": len(plan), "metadata_normalised": True}, "fingerprint": {"approved_entry_count": sum(e["status"] == "approved" for e in fingerprint["entries"]), "entries_applied": outcomes["directly_applied"], **outcomes}, "short_variant_risks": short_risks, "omitted_files": omitted, "final_check": {"passed": True, "unresolved_approved_variants": outcomes["unresolved"], "paths_checked": True}, "ai_audit": {"performed": audit is not None, "tree_digest": release_digest if audit is not None else None, "open_medium_or_high_findings": len(substantive)}, "notes": ["No original-to-replacement map is stored in this manifest."]}
     write_json(output.with_suffix(output.suffix + ".manifest.json"), manifest)
     if vault_path is not None:
         write_mapping_vault(vault_path, fingerprint, vault_passphrase or "", release_digest)

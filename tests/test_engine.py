@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from deidentify.engine import MAX_FILE_BYTES, ai_review_batches, ai_review_request, approved_replacements, audit_request, audit_review_template, build, build_plan, import_review, initial_fingerprint, json_size, portable_path_key, preview, reidentify, scan
+from deidentify.engine import MAX_FILE_BYTES, ai_review_batches, ai_review_request, approved_entry_outcomes, approved_replacements, audit_request, audit_review_template, build, build_plan, import_review, initial_fingerprint, json_size, outcome_summary, portable_path_key, preview, preview_check, rebase_fingerprint, reidentify, scan
 
 
 def approved(*entries):
@@ -149,6 +149,7 @@ class EngineTests(unittest.TestCase):
 
     def test_ai_review_batches_cover_compacted_context_with_a_byte_limit(self):
         report = {
+            "source": {"tree_digest": "sha256:" + "0" * 64},
             "candidate_inventory": [{"term": f"InternalThing{index}", "kind": "pascal_identifier", "score": 45, "occurrences": 1, "evidence": [{"path": f"component-{index}.groovy", "line": 1, "source": "content"}] * 4} for index in range(30)],
             "semantic_chunks": [{"path": f"component-{index}.groovy", "start_line": 1, "end_line": 1, "file_type": ".groovy", "text": "InternalThing " * 500} for index in range(10)],
         }
@@ -157,6 +158,50 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(all(json_size(batch) <= 10_000 for batch in batches))
         self.assertEqual(30, sum(len(batch["candidate_inventory"]) for batch in batches))
         self.assertEqual(10, sum(len(batch["semantic_chunks"]) for batch in batches))
+
+    def test_ai_review_batches_colocate_candidate_with_evidence_path(self):
+        report = {"source": {"tree_digest": "sha256:" + "1" * 64}, "candidate_inventory": [{"term": "InternalOrion", "kind": "pascal_identifier", "score": 45, "occurrences": 1, "evidence": [{"path": "service.groovy", "line": 2, "source": "content"}]}], "semantic_chunks": [{"path": "service.groovy", "start_line": 1, "end_line": 3, "file_type": ".groovy", "text": "def InternalOrion = true"}]}
+        batch = ai_review_batches(report)[0]
+        self.assertEqual("InternalOrion", batch["candidate_inventory"][0]["term"])
+        self.assertEqual("service.groovy", batch["semantic_chunks"][0]["path"])
+
+    def test_overlap_outcomes_distinguish_direct_satisfied_absent_and_unresolved(self):
+        with tempfile.TemporaryDirectory() as name:
+            parent = Path(name); root = self.source(parent)
+            (root / "ProjectOrion.yml").write_text("ProjectOrion", encoding="utf-8")
+            fingerprint = approved(("ProjectOrion", "project", ["ProjectOrion"]), ("Orion", "project", ["Orion"]), ("Missing", "project", ["Missing"]))
+            plan, _, _ = build_plan(root, fingerprint)
+            summary = outcome_summary(approved_entry_outcomes(fingerprint, plan))
+            self.assertEqual({"directly_applied": 1, "satisfied_by_overlap": 1, "not_present": 1, "unresolved": 0}, summary)
+            unresolved = approved_entry_outcomes(approved(("Orion", "project", ["Orion"])), [{"relative": Path("Orion.yml"), "target": Path("Orion.yml"), "original_text": "Orion", "text": "Orion", "applied": set()}])
+            self.assertEqual("unresolved", unresolved[0]["outcome"])
+
+    def test_bound_fingerprint_allows_relocation_but_rejects_changed_source_until_rebased(self):
+        with tempfile.TemporaryDirectory() as name:
+            parent = Path(name); root = self.source(parent); (root / "orion.yml").write_text("Orion", encoding="utf-8")
+            fingerprint = initial_fingerprint(root); fingerprint["entries"] = [{"canonical": "Orion", "category": "project", "variants": ["Orion"], "status": "approved"}]
+            build(root, fingerprint, parent / "first.tar.gz")
+            relocated = parent / "relocated"; relocated.mkdir(); (relocated / "orion.yml").write_text("Orion", encoding="utf-8")
+            build(relocated, fingerprint, parent / "relocated.tar.gz")
+            (root / "orion.yml").write_text("Orion changed", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "does not correspond"):
+                build(root, fingerprint, parent / "changed.tar.gz")
+            fingerprint, presence = rebase_fingerprint(root, fingerprint)
+            self.assertEqual(1, presence["present"])
+            build(root, fingerprint, parent / "rebased.tar.gz")
+
+    def test_preview_check_detects_changed_source_and_fingerprint(self):
+        with tempfile.TemporaryDirectory() as name:
+            parent = Path(name); root = self.source(parent); (root / "orion.yml").write_text("Orion", encoding="utf-8")
+            fingerprint = initial_fingerprint(root); fingerprint["entries"] = [{"canonical": "Orion", "category": "project", "variants": ["Orion"], "status": "approved"}]
+            artifact = preview(root, fingerprint)
+            preview_check(root, fingerprint, artifact)
+            fingerprint["entries"][0]["category"] = "internal_system"
+            with self.assertRaisesRegex(ValueError, "fingerprint changed"):
+                preview_check(root, fingerprint, artifact)
+            fingerprint["entries"][0]["category"] = "project"; (root / "orion.yml").write_text("Orion changed", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "source tree changed"):
+                preview_check(root, fingerprint, artifact)
 
     def test_import_review_approve_all_affects_only_touched_entries(self):
         fingerprint = initial_fingerprint()

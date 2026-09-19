@@ -76,6 +76,24 @@ deidentify build /path/to/project /secure/deidentify-work/fingerprint.json \
 
 `scan --shell-summary bash` prints safe Git Bash assignments for `project`, `source_repo`, and `workdir`, plus a quoted next command. It never prints secrets, fingerprint values, or candidate values. If you already have a scan report, `deidentify candidates export scan-report.json --output candidate-summary.txt` creates the same summary.
 
+## Source binding and current previews
+
+`init` and `prepare` bind a fingerprint to a deterministic logical source-tree digest: sorted relative paths plus each participating UTF-8 file's SHA-256. The binding does not contain an absolute path, so a byte-identical relocated tree works. `preview` and `build` fail closed if their source no longer matches the fingerprint.
+
+After intentionally changing source, explicitly rebase before previewing or building:
+
+```bash
+deidentify fingerprint rebase /path/to/project /secure/deidentify-work/fingerprint.json
+```
+
+Rebasing retains approved entries, reports present/absent and newly present/absent approved entries, and records the old/new digest locally; it never happens silently during a build. Previews contain `source_tree_digest`, `fingerprint_digest`, and `transformed_tree_digest`. Confirm a saved preview remains current with:
+
+```bash
+deidentify preview-check /path/to/project /secure/deidentify-work/fingerprint.json preview.json
+```
+
+Successful validation prints `Preview current: yes`.
+
 ## Optional reidentification
 
 By default, no reverse map is kept. Add `--mapping-vault` at build time only when you need to restore approved internal names after an external AI returns a modified archive. The CLI prompts for a passphrase and writes a separate encrypted vault using PBKDF2-HMAC-SHA256 and authenticated Fernet encryption. The vault records the originating transformed-tree digest as provenance, is never included in the deidentified archive or manifest, and must remain outside the source tree.
@@ -117,6 +135,8 @@ Any regular file up to 2 MB is treated as text when its bytes are valid UTF-8 an
 `preview` writes a JSON record of changed paths/content, replacement counts, responsible approved entries, output count, omissions, the transformed-tree digest, and short-variant risks. It never writes to source or produces an archive.
 
 Build uses longer exact variants first for contents and every path component. It independently scans staged paths and text after transformation; any residual approved variant blocks export. A successful CLI build explicitly reports `Approved variants remaining: 0`. Path validation and collision checks use Windows-compatible semantics, including case folding and trailing dot/space handling.
+
+The build manifest and CLI account for every approved entry as `directly_applied`, `satisfied_by_overlap`, `not_present`, or `unresolved`. Overlap-satisfied entries are not treated as failures; never-present entries are reported separately. Entry names and mappings remain out of the public manifest.
 
 Approved variants shorter than four characters are shown in preview with their affected-file and occurrence counts. They are transformed like every other approved variant; use this information to assess the impact of intentionally broad replacements.
 

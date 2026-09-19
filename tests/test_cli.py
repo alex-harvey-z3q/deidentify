@@ -127,6 +127,8 @@ class CliTests(unittest.TestCase):
             scan = self.run_cli("scan", str(source), "--report", str(report), "--ai-review-request", str(request), "--candidate-summary", str(summary), "--shell-summary", "bash")
             self.assertEqual(0, scan.returncode, scan.stderr)
             self.assertIn("source_repo=", scan.stdout); self.assertIn("next_command=", scan.stdout)
+            self.assertIn("Top-level files: 1", scan.stdout); self.assertIn("Top-level directories: 0", scan.stdout)
+            self.assertNotIn("service.groovy", scan.stdout)
             exported = root / "candidate-summary-exported.txt"
             export = self.run_cli("candidates", "export", str(report), "--output", str(exported))
             self.assertEqual(0, export.returncode, export.stderr)
