@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from deidentify.engine import MAX_FILE_BYTES, ai_review_batches, ai_review_request, approved_entry_outcomes, approved_replacements, audit_request, audit_review_template, build, build_plan, import_review, initial_fingerprint, json_size, outcome_summary, portable_path_key, preview, preview_check, rebase_fingerprint, reidentify, scan
+from deidentify.engine import MAX_FILE_BYTES, ai_review_batches, ai_review_request, approved_entry_outcomes, approved_replacements, audit_request, audit_review_template, build, build_plan, import_review, initial_fingerprint, json_size, outcome_summary, portable_path_key, preview, preview_check, rebase_fingerprint, reidentify, scan, transformed_relative
 
 
 def approved(*entries):
@@ -102,6 +102,39 @@ class EngineTests(unittest.TestCase):
             self.assertNotIn("orion", content.casefold())
             self.assertIn("__INTERNAL_SYSTEM_001__", content)
             self.assertIn("\r\n", content)
+
+    def test_approved_variants_replace_every_case_form_and_verify_cleanly(self):
+        with tempfile.TemporaryDirectory() as name:
+            parent = Path(name); root = self.source(parent)
+            (root / "service.yml").write_text("internal.example.gov\nINTERNAL.EXAMPLE.GOV\nInternal.Example.Gov\n", encoding="utf-8")
+            fingerprint = approved(("Internal.Example.Gov", "internal_system", ["Internal.Example.Gov"]))
+            preview_data = preview(root, fingerprint)
+            self.assertEqual(1, preview_data["approved_entry_outcomes"]["directly_applied"])
+            self.assertEqual(0, preview_data["approved_entry_outcomes"]["unresolved"])
+            output = parent / "release.tar.gz"; manifest = build(root, fingerprint, output)
+            content = self.archive_text(output, "service.yml")
+            self.assertNotIn("internal.example.gov", content.casefold())
+            self.assertEqual(0, manifest["final_check"]["unresolved_approved_variants"])
+
+    def test_path_replacement_is_case_insensitive(self):
+        replacements = approved_replacements(approved(("ProjectOrion", "project", ["ProjectOrion"])))
+        lower, _, _ = transformed_relative(Path("docs/projectorion/readme.md"), replacements)
+        upper, _, _ = transformed_relative(Path("docs/PROJECTORION/config.yml"), replacements)
+        self.assertEqual(Path("docs/__PROJECT_001__/readme.md"), lower)
+        self.assertEqual(Path("docs/__PROJECT_001__/config.yml"), upper)
+        self.assertFalse(any("projectorion" in path.as_posix().casefold() for path in (lower, upper)))
+
+    def test_overlap_outcomes_are_case_insensitive_and_longest_first(self):
+        with tempfile.TemporaryDirectory() as name:
+            parent = Path(name); root = self.source(parent)
+            (root / "service.yml").write_text("API.example.gov", encoding="utf-8")
+            fingerprint = approved(("Example", "project", ["example.gov"]), ("API Example", "project", ["api.EXAMPLE.GOV"]))
+            plan, _, _ = build_plan(root, fingerprint)
+            outcomes = {item["canonical"]: item for item in approved_entry_outcomes(fingerprint, plan)}
+            self.assertEqual("directly_applied", outcomes["API Example"]["outcome"])
+            self.assertEqual("satisfied_by_overlap", outcomes["Example"]["outcome"])
+            self.assertEqual(["API Example"], outcomes["Example"]["satisfied_by"])
+            self.assertNotIn("example.gov", plan[0]["text"].casefold())
 
     def test_unsupported_files_reject_by_default_and_can_be_explicitly_excluded(self):
         with tempfile.TemporaryDirectory() as name:
@@ -371,7 +404,7 @@ class EngineTests(unittest.TestCase):
             self.assertFalse(set(token) & set('<>:"/\\|?*'))
             self.assertNotIn(token.upper(), {"CON", "PRN", "AUX", "NUL"})
             preview_data = preview(root, fingerprint)
-            self.assertEqual({"AD", "aD"}, {risk["variant"] for risk in preview_data["short_variant_risks"]})
+            self.assertEqual({"AD"}, {risk["variant"] for risk in preview_data["short_variant_risks"]})
             self.assertEqual(5, sum(risk["occurrences"] for risk in preview_data["short_variant_risks"]))
             build(root, fingerprint, parent / "allowed.tar.gz")
             self.assertNotIn("AD", self.archive_text(parent / "allowed.tar.gz", "__PROJECT_001__.yml"))

@@ -20,7 +20,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 WINDOWS_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 DEFAULT_EXCLUDED_DIRS = {".git", ".hg", ".svn", "node_modules", "vendor", "dist", "build", ".venv", "venv", "__pycache__"}
 DEFAULT_EXCLUDED_FILE_NAMES = {".env", ".envrc", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"}
@@ -103,6 +103,23 @@ def require_fingerprint_source(source: Path, fingerprint: dict[str, Any]) -> str
     return current
 
 
+def variant_pattern(variant: str, *, case_insensitive: bool = True) -> re.Pattern[str]:
+    """Compile the literal matching rule used for approved fingerprint variants."""
+    return re.compile(re.escape(variant), re.IGNORECASE if case_insensitive else 0)
+
+
+def contains_variant(text: str, variant: str, *, case_insensitive: bool = True) -> bool:
+    return variant_pattern(variant, case_insensitive=case_insensitive).search(text) is not None
+
+
+def replace_variant(text: str, variant: str, replacement: str, *, case_insensitive: bool = True) -> tuple[str, int]:
+    return variant_pattern(variant, case_insensitive=case_insensitive).subn(replacement, text)
+
+
+def count_variant(text: str, variant: str, *, case_insensitive: bool = True) -> int:
+    return len(variant_pattern(variant, case_insensitive=case_insensitive).findall(text))
+
+
 def approved_entry_presence(source: Path, fingerprint: dict[str, Any]) -> dict[str, bool]:
     root = source_root(source)
     corpus: list[tuple[str, str]] = []
@@ -112,7 +129,7 @@ def approved_entry_presence(source: Path, fingerprint: dict[str, Any]) -> dict[s
         text, reason = read_text_file(root, full_path)
         if text is not None and reason is None:
             corpus.append((relative.as_posix(), text))
-    return {entry["canonical"]: any(re.search(re.escape(variant), path) or re.search(re.escape(variant), text) for variant in entry["variants"] for path, text in corpus) for entry in validate_fingerprint(fingerprint) if entry["status"] == "approved"}
+    return {entry["canonical"]: any(contains_variant(path, variant) or contains_variant(text, variant) for variant in entry["variants"] for path, text in corpus) for entry in validate_fingerprint(fingerprint) if entry["status"] == "approved"}
 
 
 def rebase_fingerprint(source: Path, fingerprint: dict[str, Any]) -> tuple[dict[str, Any], dict[str, int]]:
@@ -481,7 +498,7 @@ def approve_candidates(fingerprint: dict[str, Any]) -> tuple[dict[str, Any], int
 def approved_replacements(fingerprint: dict[str, Any]) -> list[tuple[str, str, str]]:
     counters: Counter[str] = Counter(); replacements = []
     for entry in sorted((e for e in validate_fingerprint(fingerprint) if e["status"] == "approved"), key=lambda e: (e["category"], e["canonical"].casefold())):
-        for variant in dict.fromkeys(entry["variants"]):
+        for variant in entry["variants"]:
             counters[entry["category"]] += 1
             token = f"__{entry['category'].upper()}_{counters[entry['category']]:03d}__"
             replacements.append((variant, token, entry["canonical"]))
@@ -524,18 +541,34 @@ def decrypt_mapping_vault(path: Path, passphrase: str) -> dict[str, str]:
     return token_map
 
 
-def replace_text(text: str, replacements: list[tuple[str, str, str]]) -> tuple[str, set[str], int]:
+def replace_text(text: str, replacements: list[tuple[str, str, str]], *, case_insensitive: bool = True) -> tuple[str, set[str], int]:
     applied: set[str] = set(); count = 0
+    if case_insensitive:
+        groups: dict[str, list[tuple[str, str, str]]] = {}
+        for replacement in replacements:
+            groups.setdefault(replacement[0].casefold(), []).append(replacement)
+        for group in sorted(groups.values(), key=lambda values: len(values[0][0]), reverse=True):
+            default_variant, default_token, default_canonical = group[0]
+            exact = {variant: (token, canonical) for variant, token, canonical in group}
+
+            def replace_match(match: re.Match[str]) -> str:
+                nonlocal count
+                token, canonical = exact.get(match.group(), (default_token, default_canonical))
+                applied.add(canonical); count += 1
+                return token
+
+            text = variant_pattern(default_variant).sub(replace_match, text)
+        return text, applied, count
     for variant, token, canonical in replacements:
-        text, replaced = re.subn(re.escape(variant), token, text)
+        text, replaced = replace_variant(text, variant, token, case_insensitive=case_insensitive)
         if replaced: applied.add(canonical); count += replaced
     return text, applied, count
 
 
-def transformed_relative(relative: Path, replacements: list[tuple[str, str, str]]) -> tuple[Path, set[str], int]:
+def transformed_relative(relative: Path, replacements: list[tuple[str, str, str]], *, case_insensitive: bool = True) -> tuple[Path, set[str], int]:
     parts = []; applied: set[str] = set(); count = 0
     for component in relative.parts:
-        value, names, occurrences = replace_text(component, replacements)
+        value, names, occurrences = replace_text(component, replacements, case_insensitive=case_insensitive)
         reserved = value.rstrip(". ").split(".", 1)[0].upper() in WINDOWS_RESERVED_NAMES
         if not value or value in {".", ".."} or value != value.rstrip(". ") or "/" in value or "\\" in value or "\x00" in value or reserved: raise ValueError(f"Unsafe transformed path component from {relative}")
         parts.append(value); applied.update(names); count += occurrences
@@ -583,8 +616,8 @@ def approved_entry_outcomes(fingerprint: dict[str, Any], plan: list[dict[str, An
     outcomes = []
     for entry in approved:
         variants = entry["variants"]
-        present = any(re.search(re.escape(variant), path) or re.search(re.escape(variant), text) for variant in variants for path, text in original)
-        remaining = any(re.search(re.escape(variant), path) or re.search(re.escape(variant), text) for variant in variants for path, text in transformed)
+        present = any(contains_variant(path, variant) or contains_variant(text, variant) for variant in variants for path, text in original)
+        remaining = any(contains_variant(path, variant) or contains_variant(text, variant) for variant in variants for path, text in transformed)
         if not present:
             outcome = "not_present"; satisfied_by = []
         elif entry["canonical"] in directly_applied:
@@ -593,7 +626,7 @@ def approved_entry_outcomes(fingerprint: dict[str, Any], plan: list[dict[str, An
             outcome = "unresolved"; satisfied_by = []
         else:
             outcome = "satisfied_by_overlap"
-            satisfied_by = sorted({other for variant, _, other in approved_replacements(fingerprint) if other in directly_applied and other != entry["canonical"] and any(variant != own and own in variant for own in variants)})
+            satisfied_by = sorted({other for variant, _, other in approved_replacements(fingerprint) if other in directly_applied and other != entry["canonical"] and any(variant.casefold() != own.casefold() and contains_variant(variant, own) for own in variants)})
         outcomes.append({"canonical": entry["canonical"], "outcome": outcome, "satisfied_by": satisfied_by})
     return outcomes
 
@@ -608,12 +641,16 @@ def short_variant_risks(fingerprint: dict[str, Any], plan: list[dict[str, Any]])
     for entry in validate_fingerprint(fingerprint):
         if entry["status"] != "approved":
             continue
+        seen_variants: set[str] = set()
         for variant in entry["variants"]:
             if len(variant) >= 4:
                 continue
+            if variant.casefold() in seen_variants:
+                continue
+            seen_variants.add(variant.casefold())
             files = 0; occurrences = 0
             for item in plan:
-                count = len(re.findall(re.escape(variant), item["relative"].as_posix())) + len(re.findall(re.escape(variant), item["original_text"]))
+                count = count_variant(item["relative"].as_posix(), variant) + count_variant(item["original_text"], variant)
                 if count:
                     files += 1; occurrences += count
             risks.append({"canonical": entry["canonical"], "variant": variant, "length": len(variant), "affected_files": files, "occurrences": occurrences})
@@ -640,8 +677,8 @@ def preview_check(source: Path, fingerprint: dict[str, Any], preview_artifact: d
         raise ValueError("Preview is stale: transformed tree changed")
 
 
-def remaining_approved(text: str, replacements: list[tuple[str, str, str]]) -> set[str]:
-    return {canonical for variant, _, canonical in replacements if re.search(re.escape(variant), text)}
+def remaining_approved(text: str, replacements: list[tuple[str, str, str]], *, case_insensitive: bool = True) -> set[str]:
+    return {canonical for variant, _, canonical in replacements if contains_variant(text, variant, case_insensitive=case_insensitive)}
 
 
 AUDIT_CHUNKS_PER_BATCH = 25
@@ -786,14 +823,14 @@ def reidentify(returned_archive: Path, vault_path: Path, output: Path, passphras
                 text = raw.decode("utf-8")
             except UnicodeDecodeError as exc:
                 raise ValueError(f"Returned archive is not UTF-8 text: {member.name}") from exc
-            target, _, path_count = transformed_relative(relative, replacements)
+            target, _, path_count = transformed_relative(relative, replacements, case_insensitive=False)
             target_name = target.as_posix()
             collision = next((existing for existing in targets if target_name == existing or target_name.startswith(existing + "/") or existing.startswith(target_name + "/")), None)
             if collision:
                 raise ValueError(f"Path collision while reidentifying: {targets[collision]} and {member.name}")
             targets[target_name] = member.name
-            restored_text, _, content_count = replace_text(text, replacements)
-            if remaining_approved(target.as_posix(), replacements) or remaining_approved(restored_text, replacements):
+            restored_text, _, content_count = replace_text(text, replacements, case_insensitive=False)
+            if remaining_approved(target.as_posix(), replacements, case_insensitive=False) or remaining_approved(restored_text, replacements, case_insensitive=False):
                 raise ValueError(f"Reidentification left vault tokens in {member.name}")
             restored.append((target, restored_text.encode("utf-8"), path_count + content_count))
     output.parent.mkdir(parents=True, exist_ok=True)
