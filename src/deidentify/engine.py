@@ -20,7 +20,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 
-VERSION = "0.6.1"
+VERSION = "0.6.2"
 WINDOWS_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 DEFAULT_EXCLUDED_DIRS = {".git", ".hg", ".svn", "node_modules", "vendor", "dist", "build", ".venv", "venv", "__pycache__"}
 DEFAULT_EXCLUDED_FILE_NAMES = {".env", ".envrc", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"}
@@ -41,7 +41,7 @@ CAMEL_RE = re.compile(r"\b[a-z]+(?:[A-Z][A-Za-z0-9]+){1,}\b")
 SNAKE_RE = re.compile(r"\b[a-zA-Z][a-zA-Z0-9]+(?:_[a-zA-Z0-9]+){1,}\b")
 UPPER_SNAKE_RE = re.compile(r"\b[A-Z][A-Z0-9]+(?:_[A-Z0-9]+){1,}\b")
 KEBAB_RE = re.compile(r"\b[a-z][a-z0-9]+(?:-[a-z0-9]+){1,}\b")
-PHRASE_RE = re.compile(r"\b[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,}){1,3}\b")
+PHRASE_RE = re.compile(r"\b[A-Z][a-z]{2,}(?:[ \t]+[A-Z][a-z]{2,}){1,3}\b")
 
 
 def utc_now() -> str:
@@ -271,11 +271,27 @@ def patterns() -> list[tuple[str, re.Pattern[str], int]]:
     return [("azure_resource_id", AZURE_RESOURCE_RE, 100), ("aws_arn", AWS_ARN_RE, 100), ("email", EMAIL_RE, 90), ("url", URL_RE, 80), ("domain_or_host", DOMAIN_RE, 80), ("ipv4", IPV4_RE, 65), ("ipv6", IPV6_RE, 65), ("uuid", UUID_RE, 50), ("pascal_identifier", PASCAL_RE, 45), ("proper_name_phrase", PHRASE_RE, 45), ("upper_snake_identifier", UPPER_SNAKE_RE, 35), ("lower_camel_identifier", CAMEL_RE, 25), ("snake_identifier", SNAKE_RE, 25), ("kebab_identifier", KEBAB_RE, 25)]
 
 
+def normalized_candidate_text(text: str) -> str:
+    """Normalize line endings for candidate matching only; source bytes are never changed."""
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def normalized_candidate_term(term: str) -> str | None:
+    """Keep candidate values safe for the one-record-per-line summary format."""
+    if "\r" in term or "\n" in term:
+        return None
+    term = term.replace("\t", " ").rstrip(".,;:)")
+    return term if term and term.isprintable() else None
+
+
 def extract_candidates(text: str, relative: Path, source: str) -> list[dict[str, Any]]:
+    text = normalized_candidate_text(text)
     result = []
     for kind, pattern, score in patterns():
         for match in pattern.finditer(text):
-            term = match.group(0).rstrip(".,;:)")
+            term = normalized_candidate_term(match.group(0))
+            if term is None:
+                continue
             if len(term) < 4 or term.casefold() in {"true", "false", "null", "none", "http", "https", "json", "yaml", "readme"}:
                 continue
             item = {"term": term, "kind": kind, "score": score, "source": source, "path": relative.as_posix()}
@@ -335,6 +351,8 @@ def candidate_summary(report: dict[str, Any]) -> str:
     for index, candidate in enumerate(inventory, start=1):
         if not isinstance(candidate, dict) or not isinstance(candidate.get("kind"), str) or not isinstance(candidate.get("term"), str):
             raise ValueError(f"Invalid scan report candidate at index {index}")
+        if normalized_candidate_term(candidate["term"]) != candidate["term"]:
+            raise ValueError(f"Invalid control character in scan report candidate at index {index}")
         lines.append(f"{index:04d}\t{candidate['kind']}\t{candidate['term']}")
     return "\n".join(lines) + "\n"
 

@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from deidentify.engine import MAX_FILE_BYTES, ai_review_batches, ai_review_request, approved_entry_outcomes, approved_replacements, audit_request, audit_review_template, build, build_plan, import_review, initial_fingerprint, json_size, outcome_summary, portable_path_key, preview, preview_check, rebase_fingerprint, reidentify, scan, transformed_relative
+from deidentify.engine import MAX_FILE_BYTES, ai_review_batches, ai_review_request, approved_entry_outcomes, approved_replacements, audit_request, audit_review_template, build, build_plan, candidate_summary, extract_candidates, import_review, initial_fingerprint, json_size, outcome_summary, portable_path_key, preview, preview_check, rebase_fingerprint, reidentify, scan, transformed_relative
 
 
 def approved(*entries):
@@ -45,6 +45,32 @@ class EngineTests(unittest.TestCase):
             self.assertIn("orion-api", {item["term"] for item in report["candidate_inventory"]})
             self.assertIn(".env", {item["path"] for item in report["excluded_files"]})
             self.assertIn(".git", {item["path"] for item in report["excluded_files"]})
+
+    def test_candidate_extraction_is_line_bounded_and_crlf_stable(self):
+        crlf = "Project\r\nThe next line\r\nRegions\r\nThe next line\r\nSubnets\r\nFor production\r\nWorkspaces\r\nThe configuration\r\nAzure Kubernetes Service\r\n"
+        lf = crlf.replace("\r\n", "\n")
+        crlf_candidates = extract_candidates(crlf, Path("example.txt"), "content")
+        lf_candidates = extract_candidates(lf, Path("example.txt"), "content")
+        self.assertEqual(
+            [(item["kind"], item["term"], item["line"]) for item in lf_candidates],
+            [(item["kind"], item["term"], item["line"]) for item in crlf_candidates],
+        )
+        self.assertTrue(all("\r" not in item["term"] and "\n" not in item["term"] for item in crlf_candidates))
+        phrases = {item["term"] for item in crlf_candidates if item["kind"] == "proper_name_phrase"}
+        self.assertIn("Azure Kubernetes Service", phrases)
+        self.assertFalse(any(term.startswith(("Project", "Regions", "Subnets", "Workspaces")) for term in phrases))
+
+    def test_candidate_summary_is_one_physical_line_per_safe_candidate(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = self.source(Path(name)); source_file = root / "example.txt"
+            raw = b"Project\r\nThe next line\r\nAzure Kubernetes Service\r\n"
+            source_file.write_bytes(raw)
+            report = scan(root)
+            self.assertEqual(raw, source_file.read_bytes())
+            self.assertTrue(all("\r" not in candidate["term"] and "\n" not in candidate["term"] for candidate in report["candidate_inventory"]))
+            summary = candidate_summary(report)
+            self.assertEqual(summary.count("\n"), len(summary.splitlines()))
+            self.assertTrue(all(line.startswith("#") or line.count("\t") == 2 for line in summary.splitlines()))
 
     def test_symlink_file_and_directory_are_never_read_or_archived(self):
         with tempfile.TemporaryDirectory() as name:
