@@ -52,6 +52,30 @@ The workspace is sensitive: it holds the accumulated organisation fingerprint, t
 
 The individual `init`, `scan`, `import-review`, `approve`, `preview`, `audit-request`, `audit-review-template`, and `build` commands remain available for a more conservative release process. They allow separate human approval, preview, and adversarial audit gates when required.
 
+## Manual review workflow
+
+When a local human, rather than internal AI, selects the identifiers, use the compact candidate summary. It is deterministic, has one candidate per tab-separated line, and contains no snippets or evidence. Delete unwanted lines; do not edit retained lines. The import validates the summary digest, candidate IDs, terms, kinds, and the scan report's source path before accepting it.
+
+```bash
+deidentify init /path/to/project /secure/deidentify-work/fingerprint.json
+deidentify scan /path/to/project \
+  --report /secure/deidentify-work/scan-report.json \
+  --candidate-summary /secure/deidentify-work/candidate-summary.txt \
+  --shell-summary bash
+# Delete false-positive lines from candidate-summary.txt.
+deidentify candidates import /path/to/project \
+  /secure/deidentify-work/fingerprint.json \
+  /secure/deidentify-work/scan-report.json \
+  /secure/deidentify-work/candidate-summary.txt \
+  --approve-all
+deidentify preview /path/to/project /secure/deidentify-work/fingerprint.json \
+  --output /secure/deidentify-work/preview.json
+deidentify build /path/to/project /secure/deidentify-work/fingerprint.json \
+  /secure/deidentify-work/project-deidentified.tar.gz
+```
+
+`scan --shell-summary bash` prints safe Git Bash assignments for `project`, `source_repo`, and `workdir`, plus a quoted next command. It never prints secrets, fingerprint values, or candidate values. If you already have a scan report, `deidentify candidates export scan-report.json --output candidate-summary.txt` creates the same summary.
+
 ## Optional reidentification
 
 By default, no reverse map is kept. Add `--mapping-vault` at build time only when you need to restore approved internal names after an external AI returns a modified archive. The CLI prompts for a passphrase and writes a separate encrypted vault using PBKDF2-HMAC-SHA256 and authenticated Fernet encryption. The vault records the originating transformed-tree digest as provenance, is never included in the deidentified archive or manifest, and must remain outside the source tree.
@@ -74,7 +98,7 @@ Fingerprint states are:
 
 Keep the fingerprint outside the source tree where possible and protect it as sensitive organisational data.
 
-`package` and `import-review --approve-all` are explicit user decisions to accept all candidates touched by that AI review. They never honour an AI-provided status field on its own, and they do not change unrelated existing candidates. `approve --all` is the separate explicit action for all current candidates in a fingerprint.
+`package`, `import-review --approve-all`, and `candidates import --approve-all` are explicit local CLI decisions to accept entries touched by that operation. They never honour an AI-provided status field on its own, and they do not change unrelated existing candidates. The resulting approval records its local CLI source. `approve --all` is the separate explicit action for all current candidates in a fingerprint.
 
 ## Audit binding and AI response formats
 
@@ -92,7 +116,7 @@ Any regular file up to 2 MB is treated as text when its bytes are valid UTF-8 an
 
 `preview` writes a JSON record of changed paths/content, replacement counts, responsible approved entries, output count, omissions, the transformed-tree digest, and short-variant risks. It never writes to source or produces an archive.
 
-Build uses longer exact variants first for contents and every path component. It independently scans staged paths and text after transformation; any residual approved variant blocks export. Path validation and collision checks use Windows-compatible semantics, including case folding and trailing dot/space handling.
+Build uses longer exact variants first for contents and every path component. It independently scans staged paths and text after transformation; any residual approved variant blocks export. A successful CLI build explicitly reports `Approved variants remaining: 0`. Path validation and collision checks use Windows-compatible semantics, including case folding and trailing dot/space handling.
 
 Approved variants shorter than four characters are shown in preview with their affected-file and occurrence counts. They are transformed like every other approved variant; use this information to assess the impact of intentionally broad replacements.
 

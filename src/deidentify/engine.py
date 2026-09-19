@@ -20,7 +20,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 WINDOWS_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 DEFAULT_EXCLUDED_DIRS = {".git", ".hg", ".svn", "node_modules", "vendor", "dist", "build", ".venv", "venv", "__pycache__"}
 DEFAULT_EXCLUDED_FILE_NAMES = {".env", ".envrc", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"}
@@ -245,6 +245,63 @@ def ai_review_request(report: dict[str, Any]) -> dict[str, Any]:
     return {"schema_version": 1, "purpose": "Internal-only organisation fingerprint discovery; proposals remain candidates and cannot approve replacements.", "instructions": "Review the bounded snippets and candidate inventory. Discover employer/company, customer, project/program, internal product/system, hostname/domain, repository organisation, cloud tenant/account, alias, acronym, or meaningful identifier that could fingerprint the source. Return only response_schema JSON. Do not transform content, approve entries, or invent evidence.", "candidate_inventory": report["candidate_inventory"], "semantic_chunks": report["semantic_chunks"], "response_schema": {"entries": [{"canonical": "string", "category": "company|internal_product|customer|internal_system|project|other", "variants": ["string"], "confidence": "low|medium|high", "rationale": "string", "evidence": [{"path": "string", "line": 1}]}]}}
 
 
+def scan_report_digest(report: dict[str, Any]) -> str:
+    return "sha256:" + hashlib.sha256(json.dumps(report, separators=(",", ":"), sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def candidate_summary(report: dict[str, Any]) -> str:
+    inventory = report.get("candidate_inventory")
+    if not isinstance(inventory, list):
+        raise ValueError("Invalid scan report: candidate_inventory must be a list")
+    lines = ["# deidentify candidate summary v1", f"# scan_report_digest: {scan_report_digest(report)}", "# Delete lines you do not want imported. Do not edit retained lines."]
+    for index, candidate in enumerate(inventory, start=1):
+        if not isinstance(candidate, dict) or not isinstance(candidate.get("kind"), str) or not isinstance(candidate.get("term"), str):
+            raise ValueError(f"Invalid scan report candidate at index {index}")
+        lines.append(f"{index:04d}\t{candidate['kind']}\t{candidate['term']}")
+    return "\n".join(lines) + "\n"
+
+
+def category_for_candidate(kind: str) -> str:
+    if kind in {"aws_arn", "azure_resource_id"}:
+        return "internal_infrastructure"
+    if kind == "email":
+        return "internal_identity"
+    if kind in {"domain_or_host", "url", "ipv4", "ipv6"}:
+        return "internal_endpoint"
+    return "internal_system"
+
+
+def review_from_candidate_summary(source: Path, report: dict[str, Any], summary: str) -> dict[str, Any]:
+    root = source_root(source)
+    report_source = report.get("source", {}).get("path") if isinstance(report.get("source"), dict) else None
+    if report_source != str(root):
+        raise ValueError("Scan report does not belong to the selected source directory")
+    inventory = report.get("candidate_inventory")
+    if not isinstance(inventory, list):
+        raise ValueError("Invalid scan report: candidate_inventory must be a list")
+    lines = summary.splitlines()
+    expected_header = f"# scan_report_digest: {scan_report_digest(report)}"
+    if expected_header not in lines:
+        raise ValueError("Candidate summary does not match the supplied scan report")
+    selected: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for line in lines:
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split("\t", 2)
+        if len(fields) != 3 or not re.fullmatch(r"\d{4}", fields[0]):
+            raise ValueError(f"Invalid candidate-summary line: {line!r}")
+        index = int(fields[0]) - 1
+        if index < 0 or index >= len(inventory) or index in seen:
+            raise ValueError(f"Candidate summary contains an invalid or duplicate selection: {fields[0]}")
+        candidate = inventory[index]
+        if fields[1] != candidate.get("kind") or fields[2] != candidate.get("term"):
+            raise ValueError(f"Candidate summary selection does not match scan report: {fields[0]}")
+        seen.add(index)
+        selected.append({"canonical": candidate["term"], "category": category_for_candidate(candidate["kind"]), "variants": [candidate["term"]], "confidence": "medium", "rationale": "Selected by a local human from the compact candidate summary.", "evidence": candidate.get("evidence", [])})
+    return {"entries": selected}
+
+
 def json_size(value: Any) -> int:
     """Measure the exact pretty-printed JSON representation written by write_json."""
     return len((json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8"))
@@ -320,7 +377,7 @@ def merge_review_batch_responses(index: dict[str, Any], responses_directory: Pat
     return {"entries": entries}
 
 
-def import_review(fingerprint: dict[str, Any], review: dict[str, Any], approve_all: bool = False) -> tuple[dict[str, Any], int, int, int]:
+def import_review(fingerprint: dict[str, Any], review: dict[str, Any], approve_all: bool = False, approval_source: str | None = None) -> tuple[dict[str, Any], int, int, int]:
     entries = review.get("entries")
     if not isinstance(entries, list): raise ValueError("review.entries must be a list")
     current = validate_fingerprint(fingerprint); by_name = {entry["canonical"].casefold(): entry for entry in current}; added = updated = 0; approved_keys: set[str] = set()
@@ -335,6 +392,7 @@ def import_review(fingerprint: dict[str, Any], review: dict[str, Any], approve_a
             target = {"canonical": canonical.strip(), "category": category, "variants": sorted(set(variants) | {canonical.strip()}, key=str.casefold), "status": "candidate", "confidence": confidence, "rationales": [str(proposal.get("rationale", ""))], "evidence": proposal.get("evidence", []) if isinstance(proposal.get("evidence", []), list) else [], "first_seen": utc_now(), "last_seen": utc_now()}; current.append(target); by_name[key] = target; added += 1
         if approve_all:
             target["status"] = "approved"
+            target["approval"] = {"source": approval_source or "local_cli", "approved_at": utc_now()}
             approved_keys.add(key)
     fingerprint["entries"] = sorted(current, key=lambda item: item["canonical"].casefold()); fingerprint["updated_at"] = utc_now(); validate_fingerprint(fingerprint)
     return fingerprint, added, updated, len(approved_keys)

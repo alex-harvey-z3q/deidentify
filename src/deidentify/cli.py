@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import shlex
 import sys
 from pathlib import Path
 
-from .engine import DEFAULT_REVIEW_BATCH_BYTES, ai_review_batches, ai_review_request, approve_candidates, audit_request, audit_review_template, build, import_review, initial_fingerprint, load_json, merge_review_batch_responses, preview, reidentify, require_outside_source, scan, validate_fingerprint, write_json
+from .engine import DEFAULT_REVIEW_BATCH_BYTES, ai_review_batches, ai_review_request, approve_candidates, audit_request, audit_review_template, build, candidate_summary, import_review, initial_fingerprint, load_json, merge_review_batch_responses, preview, reidentify, require_outside_source, review_from_candidate_summary, scan, validate_fingerprint, write_json
 
 
 def require_workflow_artifacts_outside_source(source: Path, **artifacts: Path | None) -> None:
@@ -47,16 +48,36 @@ def mapping_vault_passphrase() -> str:
     return passphrase
 
 
+def print_shell_summary(source: Path, workdir: Path, next_command: str) -> None:
+    print(f"project={shlex.quote(source_root_name(source))}")
+    print(f"source_repo={shlex.quote(str(source.absolute().resolve(strict=True)))}")
+    print(f"workdir={shlex.quote(str(workdir.absolute()))}")
+    print(f"next_command={shlex.quote(next_command)}")
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="deidentify", description="Create reviewed deidentified text bundles locally.")
     commands = root.add_subparsers(dest="command", required=True)
     init = commands.add_parser("init", help="Create an empty organisation fingerprint JSON file.")
-    init.add_argument("source", type=Path, help="Source repository the fingerprint will govern; the fingerprint must be outside it.")
+    init.add_argument("source", type=Path, help="Source repository the fingerprint will govern; keeping the fingerprint outside it is recommended.")
     init.add_argument("fingerprint", type=Path)
     scan_cmd = commands.add_parser("scan", help="Discover local candidate identifiers.")
     scan_cmd.add_argument("source", type=Path)
     scan_cmd.add_argument("--report", type=Path, required=True)
-    scan_cmd.add_argument("--copilot-request", "--ai-review-request", dest="ai_review_request", type=Path, required=True)
+    scan_cmd.add_argument("--copilot-request", "--ai-review-request", dest="ai_review_request", type=Path, help="Optional provider-neutral internal-AI review request JSON.")
+    scan_cmd.add_argument("--candidate-summary", type=Path, help="Write a compact, human-editable candidate list outside the source tree.")
+    scan_cmd.add_argument("--shell-summary", choices=("bash",), help="Print Git Bash-friendly safe workflow paths and the next command.")
+    candidates_cmd = commands.add_parser("candidates", help="Export or import a compact human-reviewed candidate list.")
+    candidates = candidates_cmd.add_subparsers(dest="candidates_command", required=True)
+    candidates_export = candidates.add_parser("export", help="Export a compact candidate list from a scan report.")
+    candidates_export.add_argument("scan_report", type=Path)
+    candidates_export.add_argument("--output", type=Path, required=True)
+    candidates_import = candidates.add_parser("import", help="Import selected lines from a human-edited candidate list.")
+    candidates_import.add_argument("source", type=Path)
+    candidates_import.add_argument("fingerprint", type=Path)
+    candidates_import.add_argument("scan_report", type=Path)
+    candidates_import.add_argument("candidate_summary", type=Path)
+    candidates_import.add_argument("--approve-all", action="store_true", help="Explicitly approve only entries selected by this local candidate summary.")
     prepare_cmd = commands.add_parser("prepare", help="Start the short workflow: create/update a workspace and write one internal-AI review request.")
     prepare_cmd.add_argument("source", type=Path)
     prepare_cmd.add_argument("--workspace", type=Path, required=True, help="Secure directory outside the source for the fingerprint and workflow artifacts.")
@@ -120,13 +141,46 @@ def main(argv: list[str] | None = None) -> int:
             write_json(args.fingerprint, initial_fingerprint())
             print(f"Created fingerprint: {args.fingerprint}")
         elif args.command == "scan":
-            require_workflow_artifacts_outside_source(args.source, scan_report=args.report, ai_review_request=args.ai_review_request)
+            require_workflow_artifacts_outside_source(args.source, scan_report=args.report, ai_review_request=args.ai_review_request, candidate_summary=args.candidate_summary)
             report = scan(source=args.source)
             write_json(args.report, report)
-            write_json(args.ai_review_request, ai_review_request(report))
+            if args.ai_review_request:
+                write_json(args.ai_review_request, ai_review_request(report))
+            if args.candidate_summary:
+                args.candidate_summary.parent.mkdir(parents=True, exist_ok=True)
+                args.candidate_summary.write_text(candidate_summary(report), encoding="utf-8")
             print(f"Scanned {report['source']['scanned_file_count']} text files; found {len(report['candidate_inventory'])} candidate groups.")
             print(f"Report: {args.report}")
-            print(f"Internal-AI review request: {args.ai_review_request}")
+            if args.ai_review_request:
+                print(f"Internal-AI review request: {args.ai_review_request}")
+            if args.candidate_summary:
+                print(f"Compact candidate summary: {args.candidate_summary}")
+            if args.shell_summary:
+                summary_path = args.candidate_summary or args.report.with_name("candidate-summary.txt")
+                next_command = f"deidentify candidates import {args.source.absolute()} {args.report.parent / 'fingerprint.json'} {args.report.absolute()} {summary_path.absolute()} --approve-all"
+                print_shell_summary(args.source, args.report.parent, next_command)
+        elif args.command == "candidates":
+            if args.candidates_command == "export":
+                if args.output.exists():
+                    raise ValueError(f"Refusing to overwrite existing file: {args.output}")
+                report = load_json(args.scan_report)
+                report_source = report.get("source", {}).get("path") if isinstance(report.get("source"), dict) else None
+                if not isinstance(report_source, str):
+                    raise ValueError("Invalid scan report: source.path must be a string")
+                require_workflow_artifacts_outside_source(Path(report_source), candidate_summary=args.output)
+                args.output.parent.mkdir(parents=True, exist_ok=True)
+                args.output.write_text(candidate_summary(report), encoding="utf-8")
+                print(f"Compact candidate summary: {args.output}")
+            elif args.candidates_command == "import":
+                require_workflow_artifacts_outside_source(args.source, fingerprint=args.fingerprint, scan_report=args.scan_report, candidate_summary=args.candidate_summary)
+                review = review_from_candidate_summary(args.source, load_json(args.scan_report), args.candidate_summary.read_text(encoding="utf-8"))
+                fingerprint, added, updated, approved = import_review(load_json(args.fingerprint), review, approve_all=args.approve_all, approval_source="local_human_candidate_summary" if args.approve_all else None)
+                write_json(args.fingerprint, fingerprint)
+                print(f"Imported candidate summary: {added} candidate entries added, {updated} entries updated.")
+                if args.approve_all:
+                    print(f"Approved {approved} imported/updated entries.")
+                else:
+                    print("Selected entries remain candidates. Re-run with --approve-all to explicitly approve them.")
         elif args.command == "prepare":
             paths = workspace_paths(args.workspace, args.source)
             if paths["fingerprint"].exists():
@@ -151,7 +205,7 @@ def main(argv: list[str] | None = None) -> int:
             require_workflow_artifacts_outside_source(args.source, fingerprint=args.fingerprint, ai_review_response=args.review)
             fingerprint = load_json(args.fingerprint)
             review = load_json(args.review)
-            fingerprint, added, updated, approved = import_review(fingerprint=fingerprint, review=review, approve_all=args.approve_all)
+            fingerprint, added, updated, approved = import_review(fingerprint=fingerprint, review=review, approve_all=args.approve_all, approval_source="local_cli" if args.approve_all else None)
             write_json(args.fingerprint, fingerprint)
             print(f"Imported review: {added} candidate entries added, {updated} entries updated.")
             if args.approve_all:
@@ -176,6 +230,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Created archive: {args.output}")
             print(f"Manifest: {args.output.with_suffix(args.output.suffix + '.manifest.json')}")
             print(f"Applied {manifest['fingerprint']['entries_applied']} approved fingerprint entries.")
+            print("Approved variants remaining: 0")
             if manifest["omitted_files"]:
                 print(f"Warning: {len(manifest['omitted_files'])} files/directories were omitted by policy.")
             if args.mapping_vault:
@@ -193,12 +248,13 @@ def main(argv: list[str] | None = None) -> int:
             require_workflow_artifacts_outside_source(args.source, fingerprint=paths["fingerprint"], ai_review_response=review_path, copilot_review_responses=responses_directory, archive_output=output, mapping_vault=vault_path)
             vault_passphrase = mapping_vault_passphrase() if vault_path else None
             review = load_json(review_path) if review_path else merge_review_batch_responses(load_json(paths["review_index"]), responses_directory)
-            fingerprint, added, updated, approved = import_review(load_json(paths["fingerprint"]), review, approve_all=True)
+            fingerprint, added, updated, approved = import_review(load_json(paths["fingerprint"]), review, approve_all=True, approval_source="local_cli_package")
             write_json(paths["fingerprint"], fingerprint)
             manifest = build(args.source, fingerprint, output, unsupported_policy=args.unsupported_policy, vault_path=vault_path, vault_passphrase=vault_passphrase)
             print(f"Imported review: {added} entries added, {updated} entries updated; approved {approved} touched entries.")
             print(f"Created archive: {output}")
             print(f"Manifest: {output.with_suffix(output.suffix + '.manifest.json')}")
+            print("Approved variants remaining: 0")
             if manifest["omitted_files"]:
                 print(f"Warning: {len(manifest['omitted_files'])} files/directories were omitted by policy.")
             if vault_path:

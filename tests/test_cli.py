@@ -118,3 +118,32 @@ class CliTests(unittest.TestCase):
             self.assertEqual("approved", fingerprint["entries"][0]["status"])
             self.assertTrue((workspace / "source-deidentified.tar.gz").exists())
             self.assertTrue((workspace / "source-deidentified.tar.gz.mapping.vault.json").exists())
+
+    def test_compact_candidate_summary_supports_human_review_and_build_reporting(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); source = root / "source"; source.mkdir()
+            (source / "service.groovy").write_text("def endpoint = 'https://orion.internal'\n", encoding="utf-8")
+            report = root / "scan-report.json"; summary = root / "candidate-summary.txt"; request = root / "ai-request.json"
+            scan = self.run_cli("scan", str(source), "--report", str(report), "--ai-review-request", str(request), "--candidate-summary", str(summary), "--shell-summary", "bash")
+            self.assertEqual(0, scan.returncode, scan.stderr)
+            self.assertIn("source_repo=", scan.stdout); self.assertIn("next_command=", scan.stdout)
+            exported = root / "candidate-summary-exported.txt"
+            export = self.run_cli("candidates", "export", str(report), "--output", str(exported))
+            self.assertEqual(0, export.returncode, export.stderr)
+            self.assertEqual(summary.read_text(encoding="utf-8"), exported.read_text(encoding="utf-8"))
+            lines = summary.read_text(encoding="utf-8").splitlines()
+            selected = next(line for line in lines if "\tdomain_or_host\t" in line)
+            summary.write_text("\n".join([line for line in lines if line.startswith("#")] + [selected]) + "\n", encoding="utf-8")
+            fingerprint = root / "fingerprint.json"
+            self.assertEqual(0, self.run_cli("init", str(source), str(fingerprint)).returncode)
+            imported = self.run_cli("candidates", "import", str(source), str(fingerprint), str(report), str(summary), "--approve-all")
+            self.assertEqual(0, imported.returncode, imported.stderr); self.assertIn("Approved 1 imported/updated entries", imported.stdout)
+            entry = json.loads(fingerprint.read_text(encoding="utf-8"))["entries"][0]
+            self.assertEqual("approved", entry["status"])
+            self.assertEqual("local_human_candidate_summary", entry["approval"]["source"])
+            preview = self.run_cli("preview", str(source), str(fingerprint), "--output", str(root / "preview.json"))
+            self.assertEqual(0, preview.returncode, preview.stderr)
+            built = self.run_cli("build", str(source), str(fingerprint), str(root / "bundle.tar.gz"))
+            self.assertEqual(0, built.returncode, built.stderr)
+            self.assertIn("Applied 1 approved fingerprint entries.", built.stdout)
+            self.assertIn("Approved variants remaining: 0", built.stdout)
