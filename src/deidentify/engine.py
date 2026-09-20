@@ -20,7 +20,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 
-VERSION = "0.7.0"
+VERSION = "0.7.1"
 WINDOWS_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 DEFAULT_EXCLUDED_DIRS = {".git", ".hg", ".svn", "node_modules", "vendor", "dist", "build", ".venv", "venv", "__pycache__"}
 DEFAULT_EXCLUDED_FILE_NAMES = {".env", ".envrc", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"}
@@ -28,7 +28,6 @@ GENERIC_PATH_COMPONENTS = {"src", "test", "tests", "docs", "doc", "main", "confi
 MAX_FILE_BYTES = 2_000_000
 DEFAULT_REVIEW_BATCH_BYTES = 200_000
 AUTO_APPROVAL_POLICIES = {"none", "technical-identifiers"}
-TECHNICAL_IDENTIFIER_KINDS = {"azure_resource_id", "aws_arn", "uuid", "ipv4", "ipv6"}
 MAX_REVIEW_SNIPPET_BYTES = 6_000
 DOMAIN_RE = re.compile(r"(?<![@\w-])(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}(?![\w-])")
 URL_RE = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
@@ -280,13 +279,23 @@ def internal_domain(value: str) -> bool:
     return domain.endswith((".local", ".internal", ".corp", ".private")) or any(label in {"internal", "corp", "private"} for label in labels)
 
 
-def policy_approves_candidate(candidate: dict[str, Any], policy: str) -> bool:
+def is_auto_approvable(category: str, value: str, policy: str) -> bool:
     if policy == "none":
         return False
     if policy != "technical-identifiers":
         raise ValueError(f"Unknown auto-approval policy: {policy}")
-    kind, term = candidate["kind"], candidate["term"]
-    return kind in TECHNICAL_IDENTIFIER_KINDS or (kind in {"email", "domain_or_host"} and internal_domain(term))
+    technical_patterns = {
+        "azure_resource_id": AZURE_RESOURCE_RE,
+        "aws_arn": AWS_ARN_RE,
+        "uuid": UUID_RE,
+        "ipv4": IPV4_RE,
+        "ipv6": IPV6_RE,
+    }
+    return (category in technical_patterns and technical_patterns[category].fullmatch(value) is not None) or (category == "email" and EMAIL_RE.fullmatch(value) is not None and internal_domain(value)) or (category == "domain_or_host" and DOMAIN_RE.fullmatch(value) is not None and internal_domain(value))
+
+
+def policy_approves_candidate(candidate: dict[str, Any], policy: str) -> bool:
+    return is_auto_approvable(candidate["kind"], candidate["term"], policy)
 
 
 def policy_entries(report: dict[str, Any]) -> list[dict[str, Any]]:
@@ -523,10 +532,32 @@ def import_review(fingerprint: dict[str, Any], review: dict[str, Any], approve_a
         canonical, category, variants, confidence = proposal.get("canonical"), proposal.get("category"), proposal.get("variants"), proposal.get("confidence", "medium")
         if not isinstance(canonical, str) or not canonical.strip() or not isinstance(category, str) or not re.fullmatch(r"[a-z][a-z0-9_]*", category) or not isinstance(variants, list) or not all(isinstance(v, str) and v.strip() for v in variants) or confidence not in {"low", "medium", "high"}: raise ValueError(f"review.entries[{index}] has invalid canonical, category, variants, or confidence")
         key = canonical.casefold()
+        proposal_variants = set(variants) | {canonical.strip()}
         if key in by_name:
-            target = by_name[key]; target["variants"] = sorted(set(target["variants"]) | set(variants) | {canonical.strip()}, key=str.casefold); target.setdefault("evidence", []).extend(proposal.get("evidence", []) if isinstance(proposal.get("evidence", []), list) else []); target.setdefault("rationales", []).append(str(proposal.get("rationale", ""))); target["last_seen"] = utc_now(); updated += 1
+            target = by_name[key]
+            policy = target.get("approval", {}).get("policy") if target.get("approval", {}).get("source") == "policy" else None
+            if policy:
+                existing_variants = set(target["variants"])
+                approved_variants = {variant for variant in existing_variants if is_auto_approvable(target["category"], variant, policy)} | {variant for variant in proposal_variants if is_auto_approvable(category, variant, policy)}
+                candidate_variants = (existing_variants | proposal_variants) - approved_variants
+                target["variants"] = sorted(approved_variants, key=str.casefold)
+                for variant in sorted(candidate_variants, key=str.casefold):
+                    variant_key = variant.casefold()
+                    if variant_key == key:
+                        continue
+                    if variant_key in by_name:
+                        candidate = by_name[variant_key]
+                        candidate["variants"] = sorted(set(candidate["variants"]) | {variant}, key=str.casefold)
+                        candidate["last_seen"] = utc_now()
+                        updated += 1
+                    else:
+                        candidate = {"canonical": variant, "category": category, "variants": [variant], "status": "candidate", "confidence": confidence, "rationales": [str(proposal.get("rationale", ""))], "evidence": proposal.get("evidence", []) if isinstance(proposal.get("evidence", []), list) else [], "first_seen": utc_now(), "last_seen": utc_now()}
+                        current.append(candidate); by_name[variant_key] = candidate; added += 1
+                target.setdefault("evidence", []).extend(proposal.get("evidence", []) if isinstance(proposal.get("evidence", []), list) else []); target.setdefault("rationales", []).append(str(proposal.get("rationale", ""))); target["last_seen"] = utc_now(); updated += 1
+            else:
+                target["variants"] = sorted(set(target["variants"]) | proposal_variants, key=str.casefold); target.setdefault("evidence", []).extend(proposal.get("evidence", []) if isinstance(proposal.get("evidence", []), list) else []); target.setdefault("rationales", []).append(str(proposal.get("rationale", ""))); target["last_seen"] = utc_now(); updated += 1
         else:
-            target = {"canonical": canonical.strip(), "category": category, "variants": sorted(set(variants) | {canonical.strip()}, key=str.casefold), "status": "candidate", "confidence": confidence, "rationales": [str(proposal.get("rationale", ""))], "evidence": proposal.get("evidence", []) if isinstance(proposal.get("evidence", []), list) else [], "first_seen": utc_now(), "last_seen": utc_now()}; current.append(target); by_name[key] = target; added += 1
+            target = {"canonical": canonical.strip(), "category": category, "variants": sorted(proposal_variants, key=str.casefold), "status": "candidate", "confidence": confidence, "rationales": [str(proposal.get("rationale", ""))], "evidence": proposal.get("evidence", []) if isinstance(proposal.get("evidence", []), list) else [], "first_seen": utc_now(), "last_seen": utc_now()}; current.append(target); by_name[key] = target; added += 1
         if approve_all:
             if target["status"] != "approved":
                 target["status"] = "approved"

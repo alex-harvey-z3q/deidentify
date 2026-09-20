@@ -282,6 +282,40 @@ class EngineTests(unittest.TestCase):
         self.assertEqual("approved", statuses["Already Approved"])
         self.assertEqual("candidate", statuses["Unrelated Candidate"])
 
+    def test_policy_approved_entry_does_not_grant_approval_to_imported_semantic_variant(self):
+        uuid_x = "123e4567-e89b-12d3-a456-426614174000"
+        fingerprint, _, _, _ = import_review(initial_fingerprint(), {"entries": [{"canonical": uuid_x, "category": "uuid", "variants": [uuid_x], "confidence": "high"}]}, approve_all=True, approval_source="policy", approval_policy="technical-identifiers")
+        fingerprint, _, _, _ = import_review(fingerprint, {"entries": [{"canonical": uuid_x, "category": "uuid", "variants": [uuid_x, "ProjectOrion"], "confidence": "high", "rationale": "AI discovery"}]})
+        entries = {entry["canonical"]: entry for entry in fingerprint["entries"]}
+        self.assertEqual([uuid_x], entries[uuid_x]["variants"])
+        self.assertEqual("approved", entries[uuid_x]["status"])
+        self.assertEqual("candidate", entries["ProjectOrion"]["status"])
+        self.assertNotIn("approval", entries["ProjectOrion"])
+
+    def test_policy_approved_entry_accepts_only_independently_technical_extensions(self):
+        uuid_x = "123e4567-e89b-12d3-a456-426614174000"; uuid_y = "223e4567-e89b-12d3-a456-426614174000"
+        fingerprint, _, _, _ = import_review(initial_fingerprint(), {"entries": [{"canonical": uuid_x, "category": "uuid", "variants": [uuid_x], "confidence": "high"}]}, approve_all=True, approval_source="policy", approval_policy="technical-identifiers")
+        fingerprint, _, _, _ = import_review(fingerprint, {"entries": [{"canonical": uuid_x, "category": "uuid", "variants": [uuid_x, uuid_y], "confidence": "high"}]})
+        entry = next(item for item in fingerprint["entries"] if item["canonical"] == uuid_x)
+        self.assertEqual([uuid_x, uuid_y], entry["variants"])
+        self.assertEqual("approved", entry["status"])
+
+    def test_category_mismatch_cannot_extend_policy_approval_even_with_approve_all(self):
+        uuid_x = "123e4567-e89b-12d3-a456-426614174000"
+        fingerprint, _, _, _ = import_review(initial_fingerprint(), {"entries": [{"canonical": uuid_x, "category": "uuid", "variants": [uuid_x], "confidence": "high"}]}, approve_all=True, approval_source="policy", approval_policy="technical-identifiers")
+        fingerprint, _, _, _ = import_review(fingerprint, {"entries": [{"canonical": uuid_x, "category": "project", "variants": [uuid_x, "InternalProject"], "confidence": "high"}]}, approve_all=True, approval_source="local_cli_package")
+        entries = {entry["canonical"]: entry for entry in fingerprint["entries"]}
+        self.assertEqual([uuid_x], entries[uuid_x]["variants"])
+        self.assertEqual("candidate", entries["InternalProject"]["status"])
+
+    def test_human_approved_entries_keep_normal_variant_merge_behaviour(self):
+        fingerprint = initial_fingerprint()
+        fingerprint["entries"] = [{"canonical": "Orion", "category": "project", "variants": ["Orion"], "status": "approved", "approval": {"source": "local_human"}}]
+        fingerprint, _, _, _ = import_review(fingerprint, {"entries": [{"canonical": "Orion", "category": "project", "variants": ["ProjectOrion"], "confidence": "high"}]})
+        entry = fingerprint["entries"][0]
+        self.assertEqual("approved", entry["status"])
+        self.assertEqual({"Orion", "ProjectOrion"}, set(entry["variants"]))
+
     def test_static_discovery_covers_cloud_network_and_identifier_signals(self):
         with tempfile.TemporaryDirectory() as name:
             root = self.source(Path(name))
