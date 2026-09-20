@@ -149,3 +149,22 @@ class CliTests(unittest.TestCase):
             self.assertEqual(0, built.returncode, built.stderr)
             self.assertIn("Applied 1 approved fingerprint entries.", built.stdout)
             self.assertIn("Approved variants remaining: 0", built.stdout)
+
+    def test_technical_policy_keeps_auto_entries_out_of_manual_summary_and_ai_candidates(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); source = root / "source"; source.mkdir()
+            (source / "infra.txt").write_text("10.1.2.3\nProjectOrion\n", encoding="utf-8")
+            report = root / "scan.json"; summary = root / "summary.txt"; request = root / "request.json"
+            result = self.run_cli("scan", str(source), "--report", str(report), "--candidate-summary", str(summary), "--ai-review-request", str(request), "--auto-approve-policy", "technical-identifiers")
+            self.assertEqual(0, result.returncode, result.stderr)
+            scan_report = json.loads(report.read_text(encoding="utf-8"))
+            self.assertIn("10.1.2.3", {entry["canonical"] for entry in scan_report["policy_approved_entries"]})
+            self.assertNotIn("10.1.2.3", summary.read_text(encoding="utf-8"))
+            self.assertNotIn("10.1.2.3", json.dumps(json.loads(request.read_text(encoding="utf-8"))))
+            fingerprint = root / "fingerprint.json"
+            self.assertEqual(0, self.run_cli("init", str(source), str(fingerprint)).returncode)
+            summary.write_text("\n".join(line for line in summary.read_text(encoding="utf-8").splitlines() if line.startswith("#")) + "\n", encoding="utf-8")
+            imported = self.run_cli("candidates", "import", str(source), str(fingerprint), str(report), str(summary))
+            self.assertEqual(0, imported.returncode, imported.stderr)
+            entry = next(item for item in json.loads(fingerprint.read_text(encoding="utf-8"))["entries"] if item["canonical"] == "10.1.2.3")
+            self.assertEqual({"source": "policy", "policy": "technical-identifiers"}, {key: entry["approval"][key] for key in ("source", "policy")})

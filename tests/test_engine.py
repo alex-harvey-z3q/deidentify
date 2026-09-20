@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from deidentify.engine import MAX_FILE_BYTES, ai_review_batches, ai_review_request, approved_entry_outcomes, approved_replacements, audit_request, audit_review_template, build, build_plan, candidate_summary, extract_candidates, import_review, initial_fingerprint, json_size, outcome_summary, portable_path_key, preview, preview_check, rebase_fingerprint, reidentify, scan, transformed_relative
+from deidentify.engine import MAX_FILE_BYTES, ai_review_batches, ai_review_request, approved_entry_outcomes, approved_replacements, audit_request, audit_review_template, build, build_plan, candidate_summary, extract_candidates, import_review, initial_fingerprint, json_size, outcome_summary, policy_entries, portable_path_key, preview, preview_check, rebase_fingerprint, reidentify, scan, transformed_relative
 
 
 def approved(*entries):
@@ -291,6 +291,26 @@ class EngineTests(unittest.TestCase):
             inventory = scan(root)["candidate_inventory"]
             kinds = {item["kind"] for item in inventory}
             self.assertTrue({"aws_arn", "azure_resource_id", "email", "ipv4", "ipv6", "uuid", "lower_camel_identifier", "snake_identifier", "upper_snake_identifier"}.issubset(kinds))
+
+    def test_technical_identifier_policy_approves_only_deterministic_candidates(self):
+        with tempfile.TemporaryDirectory() as name:
+            parent = Path(name); root = self.source(parent)
+            identifiers = "123e4567-e89b-12d3-a456-426614174000\n/subscriptions/123e4567-e89b-12d3-a456-426614174000/resourceGroups/orion-rg\narn:aws:iam::123456789012:role/Orion\n10.1.2.3\nfd00::1\nops@corp.internal\ngithub.com\nProjectOrion\n"
+            (root / "infra.txt").write_text(identifiers, encoding="utf-8")
+            report = scan(root, auto_approve_policy="technical-identifiers")
+            approved = policy_entries(report)
+            approved_kinds = {entry["category"] for entry in approved}
+            self.assertTrue({"azure_resource_id", "aws_arn", "uuid", "ipv4", "ipv6", "email"}.issubset(approved_kinds))
+            self.assertNotIn("github.com", {entry["canonical"] for entry in approved})
+            self.assertNotIn("ProjectOrion", {entry["canonical"] for entry in approved})
+            self.assertFalse(approved_kinds & {candidate["kind"] for candidate in report["candidate_inventory"]})
+            fingerprint, _, _, _ = import_review(initial_fingerprint(root), {"entries": approved}, approve_all=True, approval_source="policy", approval_policy="technical-identifiers")
+            self.assertTrue(all(entry["approval"]["source"] == "policy" and entry["approval"]["policy"] == "technical-identifiers" for entry in fingerprint["entries"]))
+            output = parent / "release.tar.gz"; manifest = build(root, fingerprint, output)
+            content = self.archive_text(output, "infra.txt")
+            self.assertNotIn("10.1.2.3", content)
+            self.assertIn("github.com", content)
+            self.assertEqual(len(approved), manifest["fingerprint"]["policy_approved"])
 
     def test_adversarial_audit_can_block_export(self):
         with tempfile.TemporaryDirectory() as name:

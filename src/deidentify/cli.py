@@ -6,7 +6,7 @@ import shlex
 import sys
 from pathlib import Path
 
-from .engine import DEFAULT_REVIEW_BATCH_BYTES, ai_review_batches, ai_review_request, approve_candidates, audit_request, audit_review_template, build, candidate_summary, import_review, initial_fingerprint, load_json, merge_review_batch_responses, preview, preview_check, rebase_fingerprint, reidentify, require_outside_source, review_from_candidate_summary, scan, validate_fingerprint, write_json
+from .engine import AUTO_APPROVAL_POLICIES, DEFAULT_REVIEW_BATCH_BYTES, ai_review_batches, ai_review_request, approve_candidates, audit_request, audit_review_template, build, candidate_summary, import_review, initial_fingerprint, load_json, merge_review_batch_responses, policy_entries, preview, preview_check, rebase_fingerprint, reidentify, require_outside_source, review_from_candidate_summary, scan, validate_fingerprint, write_json
 
 
 def require_workflow_artifacts_outside_source(source: Path, **artifacts: Path | None) -> None:
@@ -55,6 +55,19 @@ def print_shell_summary(source: Path, workdir: Path, next_command: str) -> None:
     print(f"next_command={shlex.quote(next_command)}")
 
 
+def print_build_summary(manifest: dict) -> None:
+    fingerprint = manifest["fingerprint"]
+    print(f"Approved fingerprint entries: {fingerprint['approved_entry_count']}")
+    print(f"  Policy-approved technical: {fingerprint['policy_approved']}")
+    print(f"  Human/AI-approved: {fingerprint['human_or_ai_approved']}")
+    print(f"Applied {fingerprint['entries_applied']} approved fingerprint entries.")
+    print(f"Directly applied: {fingerprint['directly_applied']}")
+    print(f"Satisfied by overlap: {fingerprint['satisfied_by_overlap']}")
+    print(f"Not present: {fingerprint['not_present']}")
+    print(f"Unresolved: {fingerprint['unresolved']}")
+    print("Approved variants remaining: 0")
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="deidentify", description="Create reviewed deidentified text bundles locally.")
     commands = root.add_subparsers(dest="command", required=True)
@@ -66,6 +79,7 @@ def parser() -> argparse.ArgumentParser:
     scan_cmd.add_argument("--report", type=Path, required=True)
     scan_cmd.add_argument("--copilot-request", "--ai-review-request", dest="ai_review_request", type=Path, help="Optional provider-neutral internal-AI review request JSON.")
     scan_cmd.add_argument("--candidate-summary", type=Path, help="Write a compact, human-editable candidate list outside the source tree.")
+    scan_cmd.add_argument("--auto-approve-policy", choices=sorted(AUTO_APPROVAL_POLICIES), default="none", help="Named local policy to separate deterministic technical identifiers from review candidates (default: none).")
     scan_cmd.add_argument("--shell-summary", choices=("bash",), help="Print Git Bash-friendly safe workflow paths and the next command.")
     candidates_cmd = commands.add_parser("candidates", help="Export or import a compact human-reviewed candidate list.")
     candidates = candidates_cmd.add_subparsers(dest="candidates_command", required=True)
@@ -87,6 +101,7 @@ def parser() -> argparse.ArgumentParser:
     prepare_cmd.add_argument("source", type=Path)
     prepare_cmd.add_argument("--workspace", type=Path, required=True, help="Secure directory outside the source for the fingerprint and workflow artifacts.")
     prepare_cmd.add_argument("--review-batch-bytes", type=int, default=DEFAULT_REVIEW_BATCH_BYTES, help=f"Maximum serialized bytes per Copilot review batch (default: {DEFAULT_REVIEW_BATCH_BYTES}).")
+    prepare_cmd.add_argument("--auto-approve-policy", choices=sorted(AUTO_APPROVAL_POLICIES), default="technical-identifiers", help="Named local policy applied before internal-AI review (default: technical-identifiers).")
     review = commands.add_parser("import-review", help="Import unapproved entries proposed by sanctioned internal AI.")
     review.add_argument("source", type=Path)
     review.add_argument("fingerprint", type=Path)
@@ -151,14 +166,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Created fingerprint: {args.fingerprint}")
         elif args.command == "scan":
             require_workflow_artifacts_outside_source(args.source, scan_report=args.report, ai_review_request=args.ai_review_request, candidate_summary=args.candidate_summary)
-            report = scan(source=args.source)
+            report = scan(source=args.source, auto_approve_policy=args.auto_approve_policy)
             write_json(args.report, report)
             if args.ai_review_request:
                 write_json(args.ai_review_request, ai_review_request(report))
             if args.candidate_summary:
                 args.candidate_summary.parent.mkdir(parents=True, exist_ok=True)
                 args.candidate_summary.write_text(candidate_summary(report), encoding="utf-8")
-            print(f"Scanned {report['source']['scanned_file_count']} text files; found {len(report['candidate_inventory'])} candidate groups.")
+            print(f"Scanned {report['source']['scanned_file_count']} text files; found {len(report['candidate_inventory'])} review candidate groups.")
+            print(f"Auto-approval policy: {args.auto_approve_policy}; technical entries identified: {len(policy_entries(report))}.")
             print(f"Source: {report['source']['path']}")
             print(f"Text files scanned: {report['source']['scanned_file_count']}")
             print(f"Top-level files: {report['source']['top_level_file_count']}")
@@ -186,9 +202,15 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Compact candidate summary: {args.output}")
             elif args.candidates_command == "import":
                 require_workflow_artifacts_outside_source(args.source, fingerprint=args.fingerprint, scan_report=args.scan_report, candidate_summary=args.candidate_summary)
-                review = review_from_candidate_summary(args.source, load_json(args.scan_report), args.candidate_summary.read_text(encoding="utf-8"))
-                fingerprint, added, updated, approved = import_review(load_json(args.fingerprint), review, approve_all=args.approve_all, approval_source="local_human_candidate_summary" if args.approve_all else None)
+                report = load_json(args.scan_report)
+                fingerprint = load_json(args.fingerprint)
+                policy = report.get("auto_approval_policy", "none")
+                fingerprint, policy_added, policy_updated, policy_approved = import_review(fingerprint, {"entries": policy_entries(report)}, approve_all=True, approval_source="policy", approval_policy=policy)
+                review = review_from_candidate_summary(args.source, report, args.candidate_summary.read_text(encoding="utf-8"))
+                fingerprint, added, updated, approved = import_review(fingerprint, review, approve_all=args.approve_all, approval_source="local_human_candidate_summary" if args.approve_all else None)
                 write_json(args.fingerprint, fingerprint)
+                if policy_added or policy_updated:
+                    print(f"Policy-approved technical entries: {policy_approved} ({policy_added} added, {policy_updated} updated).")
                 print(f"Imported candidate summary: {added} candidate entries added, {updated} entries updated.")
                 if args.approve_all:
                     print(f"Approved {approved} imported/updated entries.")
@@ -207,8 +229,11 @@ def main(argv: list[str] | None = None) -> int:
                 fingerprint = load_json(paths["fingerprint"])
                 validate_fingerprint(fingerprint)
             else:
-                write_json(paths["fingerprint"], initial_fingerprint(args.source))
-            report = scan(source=args.source)
+                fingerprint = initial_fingerprint(args.source)
+                write_json(paths["fingerprint"], fingerprint)
+            report = scan(source=args.source, auto_approve_policy=args.auto_approve_policy)
+            fingerprint, policy_added, policy_updated, policy_approved = import_review(fingerprint, {"entries": policy_entries(report)}, approve_all=True, approval_source="policy", approval_policy=args.auto_approve_policy)
+            write_json(paths["fingerprint"], fingerprint)
             write_json(paths["report"], report)
             batches = ai_review_batches(report, args.review_batch_bytes)
             index_batches = []
@@ -218,6 +243,7 @@ def main(argv: list[str] | None = None) -> int:
                 index_batches.append({"batch_id": batch["batch_id"], "batch_digest": batch["batch_digest"], "request_file": filename, "response_file": filename})
             write_json(paths["review_index"], {"schema_version": 1, "purpose": "Copilot review batch index. Attach every file in batches/ to sanctioned internal Copilot and save the JSON-only response using the same filename in responses/.", "batches": index_batches})
             print(f"Prepared workspace: {args.workspace}")
+            print(f"Auto-approval policy: {args.auto_approve_policy}; policy-approved technical entries: {policy_approved} ({policy_added} added, {policy_updated} updated).")
             print(f"Copilot review index: {paths['review_index']}")
             print(f"Copilot review batches: {paths['review_batches']} ({len(batches)} files, at most {args.review_batch_bytes} bytes each)")
             print("Save each JSON-only Copilot response using the same filename in: " + str(paths["review_responses"]))
@@ -249,13 +275,7 @@ def main(argv: list[str] | None = None) -> int:
             manifest = build(args.source, fingerprint, args.output, unsupported_policy=args.unsupported_policy, audit=audit, audit_review=audit_review, fail_on_ai_findings=args.fail_on_ai_findings, vault_path=args.mapping_vault, vault_passphrase=vault_passphrase)
             print(f"Created archive: {args.output}")
             print(f"Manifest: {args.output.with_suffix(args.output.suffix + '.manifest.json')}")
-            print(f"Approved fingerprint entries: {manifest['fingerprint']['approved_entry_count']}")
-            print(f"Applied {manifest['fingerprint']['entries_applied']} approved fingerprint entries.")
-            print(f"Directly applied: {manifest['fingerprint']['directly_applied']}")
-            print(f"Satisfied by overlap: {manifest['fingerprint']['satisfied_by_overlap']}")
-            print(f"Not present: {manifest['fingerprint']['not_present']}")
-            print(f"Unresolved: {manifest['fingerprint']['unresolved']}")
-            print("Approved variants remaining: 0")
+            print_build_summary(manifest)
             if manifest["omitted_files"]:
                 print(f"Warning: {len(manifest['omitted_files'])} files/directories were omitted by policy.")
             if args.mapping_vault:
@@ -279,13 +299,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Imported review: {added} entries added, {updated} entries updated; approved {approved} touched entries.")
             print(f"Created archive: {output}")
             print(f"Manifest: {output.with_suffix(output.suffix + '.manifest.json')}")
-            print(f"Approved fingerprint entries: {manifest['fingerprint']['approved_entry_count']}")
-            print(f"Applied {manifest['fingerprint']['entries_applied']} approved fingerprint entries.")
-            print(f"Directly applied: {manifest['fingerprint']['directly_applied']}")
-            print(f"Satisfied by overlap: {manifest['fingerprint']['satisfied_by_overlap']}")
-            print(f"Not present: {manifest['fingerprint']['not_present']}")
-            print(f"Unresolved: {manifest['fingerprint']['unresolved']}")
-            print("Approved variants remaining: 0")
+            print_build_summary(manifest)
             if manifest["omitted_files"]:
                 print(f"Warning: {len(manifest['omitted_files'])} files/directories were omitted by policy.")
             if vault_path:

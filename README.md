@@ -42,7 +42,7 @@ deidentify reidentify returned-from-chatgpt.tar.gz /secure/deidentify-work/proje
   restored-internal.tar.gz
 ```
 
-`prepare` creates or reuses `fingerprint.json` in the workspace, scans the source, and writes size-bounded Copilot review batches. The default maximum is 200,000 serialized bytes per batch; change it with `--review-batch-bytes` if your sanctioned Copilot environment has a lower attachment/context limit. Every batch includes its own provider-neutral prompt, response schema, `batch_id`, and digest. `package` requires a matching JSON response for every batch, verifies each identity and digest, imports their combined entries, approves exactly the entries touched by those responses, then builds an archive and encrypted mapping vault. It prompts for the vault passphrase. Its default `--unsupported-policy exclude` omits non-text files rather than blocking the bundle; omissions are recorded in the manifest. Use `--unsupported-policy reject` when completeness matters more than convenience.
+`prepare` creates or reuses `fingerprint.json` in the workspace, scans the source, applies its default `technical-identifiers` local policy, and writes size-bounded Copilot review batches. The default maximum is 200,000 serialized bytes per batch; change it with `--review-batch-bytes` if your sanctioned Copilot environment has a lower attachment/context limit. Every batch includes its own provider-neutral prompt, response schema, `batch_id`, and digest. `package` requires a matching JSON response for every batch, verifies each identity and digest, imports their combined entries, approves exactly the entries touched by those responses, then builds an archive and encrypted mapping vault. It prompts for the vault passphrase. Its default `--unsupported-policy exclude` omits non-text files rather than blocking the bundle; omissions are recorded in the manifest. Use `--unsupported-policy reject` when completeness matters more than convenience.
 
 The workspace is sensitive: it holds the accumulated organisation fingerprint, the AI review artifacts, and the encrypted vault. Keep it outside the repository and in an access-controlled location. `package --no-mapping-vault` is available only when reidentification is not needed.
 
@@ -106,6 +106,14 @@ Each exact approved spelling/case variant receives its own token, so reidentific
 
 Static discovery ranks candidates from paths and file contents, retaining whether evidence is path- or content-based. It checks domains, URLs, email addresses/domains, IP addresses, UUIDs, AWS ARNs, Azure resource identifiers, proper names, PascalCase, lowerCamelCase, snake_case, uppercase identifiers, and kebab-case identifiers. Candidates are not declarations of sensitivity.
 
+### Technical identifier policy
+
+The named `technical-identifiers` policy promotes deterministic scanner findings locally before AI or human review: Azure resource IDs, AWS ARNs, UUIDs, IPv4 and IPv6 addresses, plus email addresses and `domain_or_host` values only when their domain is plainly internal (`.local`, `.internal`, `.corp`, `.private`, or an `internal`, `corp`, or `private` DNS label). Every promoted entry has `status: "approved"` and an `approval` record with `source: "policy"` and `policy: "technical-identifiers"`.
+
+`prepare` uses this policy by default and reports its activity. `scan` remains conservative by default; enable it explicitly with `--auto-approve-policy technical-identifiers`. Its compact candidate summary and internal-AI request omit policy-approved values, reducing manual review volume and AI context. `candidates import` applies the policy entries stored in such a scan report before importing the human-selected lines. Use `--auto-approve-policy none` with `prepare` when no automatic promotion is wanted.
+
+Public/common domains such as `github.com`, `microsoft.com`, `azure.com`, and `python.org`, along with URLs, proper-name phrases, project names, acronyms, and identifier-style names, remain human/AI-reviewed. The policy does not infer whether an address is secret and does not redact architecture descriptions or business logic. Unique semantic or architectural context can still identify an organisation and needs the normal review process.
+
 The AI review artifacts contain a compact candidate inventory and at most 200 short source snippets. They are partitioned by serialized byte size, not a fragile item count, so each Copilot request is independently reviewable. The bounded context helps discover aliases, codenames, naming conventions, and business context without sending the entire repository in one request.
 
 Fingerprint states are:
@@ -137,6 +145,8 @@ Any regular file up to 2 MB is treated as text when its bytes are valid UTF-8 an
 Build uses longer exact variants first for contents and every path component. It independently scans staged paths and text after transformation; any residual approved variant blocks export. A successful CLI build explicitly reports `Approved variants remaining: 0`. Path validation and collision checks use Windows-compatible semantics, including case folding and trailing dot/space handling.
 
 The build manifest and CLI account for every approved entry as `directly_applied`, `satisfied_by_overlap`, `not_present`, or `unresolved`. Overlap-satisfied entries are not treated as failures; never-present entries are reported separately. Entry names and mappings remain out of the public manifest.
+
+The same manifest and build output separately count policy-approved technical entries and human/AI-approved entries. Preview changes include their approval source, so policy transformations remain visible in local review artifacts.
 
 Approved variants shorter than four characters are shown in preview with their affected-file and occurrence counts. They are transformed like every other approved variant; use this information to assess the impact of intentionally broad replacements.
 
