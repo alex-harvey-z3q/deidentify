@@ -37,14 +37,15 @@ deidentify prepare /path/to/project --workspace /secure/deidentify-work
 # Save every response using the same filename in internal-ai-review/responses/.
 deidentify package /path/to/project --workspace /secure/deidentify-work
 
-# After ChatGPT returns a modified tarball, restore it only in an approved local environment.
-deidentify reidentify returned-from-chatgpt.tar.gz /secure/deidentify-work/project-deidentified.tar.gz.mapping.vault.json \
-  restored-internal.tar.gz
+# After ChatGPT returns a modified tarball, restore it locally using the trusted fingerprint.
+deidentify reidentify returned-from-chatgpt.tar.gz \
+  --fingerprint /secure/deidentify-work/fingerprint.json \
+  --output-dir restored-internal
 ```
 
-`prepare` creates or reuses `fingerprint.json` in the workspace, scans the source, applies its default `technical-identifiers` local policy, and writes size-bounded Copilot review batches. The default maximum is 200,000 serialized bytes per batch; change it with `--review-batch-bytes` if your sanctioned Copilot environment has a lower attachment/context limit. Every batch includes its own provider-neutral prompt, response schema, `batch_id`, and digest. `package` requires a matching JSON response for every batch, verifies each identity and digest, imports their combined entries, approves exactly the entries touched by those responses, then builds an archive and encrypted mapping vault. It prompts for the vault passphrase. Its default `--unsupported-policy exclude` omits non-text files rather than blocking the bundle; omissions are recorded in the manifest. Use `--unsupported-policy reject` when completeness matters more than convenience.
+`prepare` creates or reuses `fingerprint.json` in the workspace, scans the source, applies its default `technical-identifiers` local policy, and writes size-bounded Copilot review batches. The default maximum is 200,000 serialized bytes per batch; change it with `--review-batch-bytes` if your sanctioned Copilot environment has a lower attachment/context limit. Every batch includes its own provider-neutral prompt, response schema, `batch_id`, and digest. `package` requires a matching JSON response for every batch, verifies each identity and digest, imports their combined entries, approves exactly the entries touched by those responses, then builds an archive. It can also create an encrypted mapping vault for portable historical recovery, but the fingerprint is sufficient for the normal reidentification path. Its default `--unsupported-policy exclude` omits non-text files rather than blocking the bundle; omissions are recorded in the manifest. Use `--unsupported-policy reject` when completeness matters more than convenience.
 
-The workspace is sensitive: it holds the accumulated organisation fingerprint, the AI review artifacts, and the encrypted vault. Keep it outside the repository and in an access-controlled location. `package --no-mapping-vault` is available only when reidentification is not needed.
+The workspace is sensitive: it holds the accumulated organisation fingerprint, AI review artifacts, and optionally an encrypted vault. Keep it outside the repository and in an access-controlled location. `package --no-mapping-vault` skips only the portable vault; fingerprint-driven reidentification remains available.
 
 `--copilot-request` remains a compatible alias for `--ai-review-request`; the request content is provider-neutral.
 
@@ -104,11 +105,11 @@ deidentify reidentify returned.tar.gz --fingerprint /secure/deidentify-work/fing
 
 It restores exact listed fingerprint variants in returned UTF-8 text and paths, preserves every other returned text edit, copies binary bytes unchanged, and accepts ordinary tar directory entries. `--source` is optional extra provenance verification and fails closed if the bound source has changed. A mapping vault remains a portable encrypted snapshot for cases where the fingerprint is unavailable: `deidentify reidentify returned.tar.gz --mapping-vault vault.json --output-dir restored/`. The fingerprint itself contains sensitive original values and must be protected.
 
-By default, no reverse map is kept. Add `--mapping-vault` at build time only when you need to restore approved internal names after an external AI returns a modified archive. The CLI prompts for a passphrase and writes a separate encrypted vault using PBKDF2-HMAC-SHA256 and authenticated Fernet encryption. The vault records the originating transformed-tree digest as provenance, is never included in the deidentified archive or manifest, and must remain outside the source tree.
+The vault is optional: use `--mapping-vault` at build time when you need a portable encrypted mapping snapshot, reidentification without distributing the fingerprint, or historical release provenance. The CLI prompts for a passphrase and writes a separate encrypted vault using PBKDF2-HMAC-SHA256 and authenticated Fernet encryption. The vault records the originating transformed-tree digest as provenance, is never included in the deidentified archive or manifest, and must remain outside the source tree.
 
-`reidentify` reads a returned tarball without extracting it, rejects symlinks, unsafe paths, non-regular members, binary or non-UTF-8 files, and path collisions, then creates a fresh local tarball with normalised metadata. It accepts any UTF-8 filename because a token can replace an entire filename and remove its original extension. It never modifies the returned archive.
+`reidentify` reads a returned tarball without extracting it, accepts ordinary directory entries, rejects symlinks, unsafe paths, and other non-regular member types, and fails closed on restored-path collisions. It restores text tokens in paths and UTF-8 contents, copies binary bytes unchanged while still restoring their paths, and writes directly to a new directory. It never modifies the returned archive.
 
-Each exact approved spelling/case variant receives its own token, so reidentification restores the original exported paths and UTF-8 text byte-for-byte when the returned archive preserves those tokens. Keep the vault and its passphrase as sensitive credentials; losing either makes reidentification impossible. Files omitted by `--unsupported-policy exclude` are not part of the bundle and cannot be restored.
+Each exact approved spelling/case variant receives its own token, so reidentification restores that listed variant wherever its token remains. It preserves all other returned edits rather than restoring complete original files. Keep both the fingerprint and any vault credentials as sensitive data; a vault is needed only when the fingerprint is unavailable. Files omitted by `--unsupported-policy exclude` are not part of the bundle and cannot be restored.
 
 ## Discovery and review
 
