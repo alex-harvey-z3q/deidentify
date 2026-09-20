@@ -3,6 +3,7 @@ import shutil
 import tarfile
 import tempfile
 import unittest
+from io import BytesIO
 from pathlib import Path
 
 from deidentify.engine import MAX_FILE_BYTES, ai_review_batches, ai_review_request, approved_entry_outcomes, approved_replacements, audit_request, audit_review_template, build, build_plan, candidate_summary, extract_candidates, import_review, initial_fingerprint, json_size, outcome_summary, policy_entries, portable_path_key, preview, preview_check, rebase_fingerprint, reidentify, scan, transformed_relative
@@ -433,6 +434,20 @@ class EngineTests(unittest.TestCase):
             reidentify(deidentified, vault, restored, "passphrase")
             self.assertEqual({"Orion-ORION.yml"}, self.archive_names(restored))
             self.assertEqual("Orion ORION orion\n", self.archive_text(restored, "Orion-ORION.yml"))
+
+    def test_fingerprint_reidentify_to_directory_preserves_edits_binaries_and_directories(self):
+        with tempfile.TemporaryDirectory() as name:
+            parent = Path(name); fingerprint = approved(("Orion", "internal_product", ["Orion"])); token = "__INTERNAL_PRODUCT_001__"
+            returned = parent / "returned.tar.gz"
+            with tarfile.open(returned, "w:gz") as archive:
+                directory = tarfile.TarInfo("."); directory.type = tarfile.DIRTYPE; archive.addfile(directory)
+                directory = tarfile.TarInfo(f"{token}/"); directory.type = tarfile.DIRTYPE; archive.addfile(directory)
+                text = b"name: __INTERNAL_PRODUCT_001__\nchanged: true\n"; info = tarfile.TarInfo(f"{token}/edited.yml"); info.size = len(text); archive.addfile(info, BytesIO(text))
+                binary = b"\x89PNG\x00\x01"; info = tarfile.TarInfo(f"{token}/architecture.png"); info.size = len(binary); archive.addfile(info, BytesIO(binary))
+            output_dir = parent / "restored"
+            reidentify(returned, fingerprint=fingerprint, output_dir=output_dir)
+            self.assertEqual("name: Orion\nchanged: true\n", (output_dir / "Orion" / "edited.yml").read_text())
+            self.assertEqual(b"\x89PNG\x00\x01", (output_dir / "Orion" / "architecture.png").read_bytes())
 
     def test_reidentify_rejects_unsafe_returned_archive_members(self):
         with tempfile.TemporaryDirectory() as name:

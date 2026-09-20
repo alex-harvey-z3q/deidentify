@@ -595,15 +595,19 @@ def approved_replacements(fingerprint: dict[str, Any]) -> list[tuple[str, str, s
 def mapping_vault(fingerprint: dict[str, Any], passphrase: str, release_tree_digest: str | None = None) -> dict[str, Any]:
     if not passphrase:
         raise ValueError("Mapping-vault passphrase must not be empty")
-    token_map: dict[str, str] = {}
-    for variant, token, _ in approved_replacements(fingerprint):
-        token_map[token] = variant
-    if not token_map:
-        raise ValueError("No approved mappings available for a vault")
+    token_map = mapping_from_fingerprint(fingerprint)
     salt = os.urandom(16)
     key = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=600_000).derive(passphrase.encode("utf-8"))
     plaintext = json.dumps({"schema_version": 1, "token_map": token_map, "release_tree_digest": release_tree_digest}, sort_keys=True).encode("utf-8")
     return {"schema_version": 1, "kdf": {"name": "PBKDF2-HMAC-SHA256", "iterations": 600_000, "salt": urlsafe_b64encode(salt).decode("ascii")}, "ciphertext": Fernet(urlsafe_b64encode(key)).encrypt(plaintext).decode("ascii")}
+
+
+def mapping_from_fingerprint(fingerprint: dict[str, Any]) -> dict[str, str]:
+    replacements = approved_replacements(fingerprint)
+    mapping = {token: variant for variant, token, _ in replacements}
+    if not mapping or len(mapping) != len(replacements):
+        raise ValueError("Approved mappings cannot be reconstructed unambiguously")
+    return mapping
 
 
 def write_mapping_vault(path: Path, fingerprint: dict[str, Any], passphrase: str, release_tree_digest: str | None = None) -> None:
@@ -878,54 +882,64 @@ def build(source: Path, fingerprint: dict[str, Any], output: Path, unsupported_p
     return manifest
 
 
-def safe_archive_relative(name: str) -> Path:
+def safe_archive_relative(name: str) -> Path | None:
     raw = PurePosixPath(name)
+    if str(raw) == ".": return None
     if raw.is_absolute() or not raw.parts or any(part in {"", ".", ".."} for part in raw.parts):
         raise ValueError(f"Unsafe path in returned archive: {name}")
     return Path(*raw.parts)
 
 
-def reidentify(returned_archive: Path, vault_path: Path, output: Path, passphrase: str) -> dict[str, Any]:
-    """Restore canonical values from an encrypted vault into a new local tarball."""
-    if output.exists() or output.with_suffix(output.suffix + ".manifest.json").exists():
-        raise ValueError("Refusing to overwrite an existing reidentified archive or manifest")
-    token_map = decrypt_mapping_vault(vault_path, passphrase)
+def reidentify(returned_archive: Path, vault_path: Path | None = None, output: Path | None = None, passphrase: str | None = None, *, fingerprint: dict[str, Any] | None = None, source: Path | None = None, output_dir: Path | None = None) -> dict[str, Any]:
+    """Reverse placeholders in a returned archive without changing unrelated returned bytes."""
+    if (fingerprint is None) == (vault_path is None): raise ValueError("Supply exactly one mapping source: fingerprint or mapping vault")
+    if (output is None) == (output_dir is None): raise ValueError("Supply exactly one output: archive output or output directory")
+    if source is not None:
+        if fingerprint is None: raise ValueError("Source verification requires a fingerprint")
+        require_fingerprint_source(source, fingerprint)
+    if output is not None and output.exists(): raise ValueError("Refusing to overwrite an existing reidentified archive")
+    if output_dir is not None and output_dir.exists(): raise ValueError("Refusing to overwrite an existing reidentified output directory")
+    token_map = mapping_from_fingerprint(fingerprint) if fingerprint is not None else decrypt_mapping_vault(vault_path, passphrase or "")
     replacements = sorted([(token, canonical, token) for token, canonical in token_map.items()], key=lambda item: len(item[0]), reverse=True)
-    restored: list[tuple[Path, bytes, int]] = []; targets: dict[str, str] = {}
+    restored: list[tuple[Path, bytes, int]] = []; targets: set[str] = set(); directories: set[str] = set()
     try:
         archive = tarfile.open(returned_archive, "r:*")
     except (OSError, tarfile.TarError) as exc:
         raise ValueError(f"Cannot read returned archive: {exc}") from exc
     with archive:
         for member in archive.getmembers():
-            if not member.isfile():
+            if not (member.isfile() or member.isdir()):
                 raise ValueError(f"Returned archive contains non-regular member: {member.name}")
             relative = safe_archive_relative(member.name)
-            if member.size > MAX_FILE_BYTES:
-                raise ValueError(f"Returned archive member exceeds {MAX_FILE_BYTES} bytes: {member.name}")
-            stream = archive.extractfile(member)
-            raw = stream.read() if stream else b""
-            if b"\x00" in raw:
-                raise ValueError(f"Returned archive has binary content: {member.name}")
-            try:
-                text = raw.decode("utf-8")
-            except UnicodeDecodeError as exc:
-                raise ValueError(f"Returned archive is not UTF-8 text: {member.name}") from exc
+            if relative is None: continue
             target, _, path_count = transformed_relative(relative, replacements, case_insensitive=False)
             target_name = target.as_posix()
-            collision = next((existing for existing in targets if target_name == existing or target_name.startswith(existing + "/") or existing.startswith(target_name + "/")), None)
-            if collision:
-                raise ValueError(f"Path collision while reidentifying: {targets[collision]} and {member.name}")
-            targets[target_name] = member.name
-            restored_text, _, content_count = replace_text(text, replacements, case_insensitive=False)
-            if remaining_approved(target.as_posix(), replacements, case_insensitive=False) or remaining_approved(restored_text, replacements, case_insensitive=False):
-                raise ValueError(f"Reidentification left vault tokens in {member.name}")
-            restored.append((target, restored_text.encode("utf-8"), path_count + content_count))
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(output, "w:gz") as archive:
-        for target, raw, _ in sorted(restored, key=lambda item: item[0].as_posix()):
-            info = tarfile.TarInfo(target.as_posix()); info.size = len(raw); info.mode = 0o644; info.uid = info.gid = 0; info.uname = info.gname = ""; info.mtime = 0
-            archive.addfile(info, BytesIO(raw))
-    manifest = {"schema_version": 1, "tool_version": VERSION, "created_at": utc_now(), "archive": {"filename": output.name, "sha256": hashlib.sha256(output.read_bytes()).hexdigest(), "file_count": len(restored), "metadata_normalised": True}, "reidentified_token_occurrences": sum(count for _, _, count in restored), "notes": ["Canonical values were restored from an encrypted mapping vault; original spelling variants are not reconstructed."]}
-    write_json(output.with_suffix(output.suffix + ".manifest.json"), manifest)
+            if member.isdir(): directories.add(target_name); continue
+            if target_name in targets or target_name in directories or any(target_name.startswith(item + "/") for item in targets): raise ValueError(f"Path collision while reidentifying: {member.name}")
+            stream = archive.extractfile(member); raw = stream.read() if stream else b""
+            try: text = raw.decode("utf-8") if b"\x00" not in raw else None
+            except UnicodeDecodeError: text = None
+            if text is None: changed, content_count = raw, 0
+            else:
+                restored_text, _, content_count = replace_text(text, replacements, case_insensitive=False)
+                if remaining_approved(restored_text, replacements, case_insensitive=False): raise ValueError(f"Reidentification left vault tokens in {member.name}")
+                changed = restored_text.encode("utf-8")
+            if remaining_approved(target.as_posix(), replacements, case_insensitive=False): raise ValueError(f"Reidentification left vault tokens in {member.name}")
+            targets.add(target_name); restored.append((target, changed, path_count + content_count))
+    if output_dir is not None:
+        output_dir.mkdir(parents=True)
+        for directory in directories: (output_dir / directory).mkdir(parents=True, exist_ok=True)
+        for target, raw, _ in restored:
+            destination = output_dir / target; destination.parent.mkdir(parents=True, exist_ok=True); destination.write_bytes(raw)
+        manifest_path = output_dir.parent / f"{output_dir.name}.manifest.json"; archive = {"directory": output_dir.name, "file_count": len(restored)}
+    else:
+        assert output is not None; output.parent.mkdir(parents=True, exist_ok=True)
+        archive = {"filename": output.name, "file_count": len(restored), "metadata_normalised": True}; manifest_path = output.with_suffix(output.suffix + ".manifest.json")
+        archive_output = output
+        with tarfile.open(archive_output, "w:gz") as tar:
+            for target, raw, _ in sorted(restored, key=lambda item: item[0].as_posix()):
+                info = tarfile.TarInfo(target.as_posix()); info.size = len(raw); info.mode = 0o644; info.mtime = 0; tar.addfile(info, BytesIO(raw))
+        archive["sha256"] = hashlib.sha256(archive_output.read_bytes()).hexdigest()
+    manifest = {"schema_version": 1, "tool_version": VERSION, "created_at": utc_now(), "archive": archive, "reidentified_token_occurrences": sum(count for _, _, count in restored)}
+    write_json(manifest_path, manifest)
     return manifest

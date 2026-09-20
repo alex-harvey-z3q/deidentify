@@ -149,10 +149,15 @@ def parser() -> argparse.ArgumentParser:
     audit_review_cmd.add_argument("audit_findings", type=Path)
     audit_review_cmd.add_argument("--output", type=Path, required=True)
     audit_review_cmd.add_argument("--unsupported-policy", choices=("reject", "exclude"), default="reject")
-    reidentify_cmd = commands.add_parser("reidentify", help="Restore canonical values in a returned tarball using an encrypted mapping vault.")
+    reidentify_cmd = commands.add_parser("reidentify", help="Restore returned placeholders using a fingerprint or encrypted mapping vault.")
     reidentify_cmd.add_argument("returned_archive", type=Path)
-    reidentify_cmd.add_argument("mapping_vault", type=Path)
-    reidentify_cmd.add_argument("output", type=Path)
+    reidentify_cmd.add_argument("legacy_mapping_vault", type=Path, nargs="?")
+    reidentify_cmd.add_argument("legacy_output", type=Path, nargs="?")
+    reidentify_cmd.add_argument("--fingerprint", type=Path)
+    reidentify_cmd.add_argument("--mapping-vault", type=Path)
+    reidentify_cmd.add_argument("--source", type=Path)
+    reidentify_cmd.add_argument("--output", type=Path)
+    reidentify_cmd.add_argument("--output-dir", type=Path)
     return root
 
 
@@ -324,9 +329,12 @@ def main(argv: list[str] | None = None) -> int:
             write_json(args.output, audit_review_template(source=args.source, fingerprint=fingerprint, audit=load_json(args.audit_findings), unsupported_policy=args.unsupported_policy))
             print(f"Human audit-review template: {args.output}")
         elif args.command == "reidentify":
-            manifest = reidentify(returned_archive=args.returned_archive, vault_path=args.mapping_vault, output=args.output, passphrase=getpass.getpass("Mapping-vault passphrase: "))
-            print(f"Created reidentified archive: {args.output}")
-            print(f"Manifest: {args.output.with_suffix(args.output.suffix + '.manifest.json')}")
+            vault = args.mapping_vault or args.legacy_mapping_vault; output = args.output or args.legacy_output
+            if args.mapping_vault and args.legacy_mapping_vault: raise ValueError("Use either --mapping-vault or legacy positional vault syntax")
+            if args.fingerprint and vault: raise ValueError("Use exactly one of --fingerprint or --mapping-vault")
+            fingerprint = load_json(args.fingerprint) if args.fingerprint else None
+            manifest = reidentify(args.returned_archive, vault_path=vault, output=output, passphrase=getpass.getpass("Mapping-vault passphrase: ") if vault else None, fingerprint=fingerprint, source=args.source, output_dir=args.output_dir)
+            print(f"Created reidentified {'directory' if args.output_dir else 'archive'}: {args.output_dir or output}")
             print(f"Restored {manifest['reidentified_token_occurrences']} token occurrences to their original exact values.")
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)

@@ -96,6 +96,14 @@ Successful validation prints `Preview current: yes`.
 
 ## Optional reidentification
 
+The usual reidentification path needs only the trusted local fingerprint; it does not require the original source tree or a mapping vault:
+
+```bash
+deidentify reidentify returned.tar.gz --fingerprint /secure/deidentify-work/fingerprint.json --output-dir restored/
+```
+
+It restores exact listed fingerprint variants in returned UTF-8 text and paths, preserves every other returned text edit, copies binary bytes unchanged, and accepts ordinary tar directory entries. `--source` is optional extra provenance verification and fails closed if the bound source has changed. A mapping vault remains a portable encrypted snapshot for cases where the fingerprint is unavailable: `deidentify reidentify returned.tar.gz --mapping-vault vault.json --output-dir restored/`. The fingerprint itself contains sensitive original values and must be protected.
+
 By default, no reverse map is kept. Add `--mapping-vault` at build time only when you need to restore approved internal names after an external AI returns a modified archive. The CLI prompts for a passphrase and writes a separate encrypted vault using PBKDF2-HMAC-SHA256 and authenticated Fernet encryption. The vault records the originating transformed-tree digest as provenance, is never included in the deidentified archive or manifest, and must remain outside the source tree.
 
 `reidentify` reads a returned tarball without extracting it, rejects symlinks, unsafe paths, non-regular members, binary or non-UTF-8 files, and path collisions, then creates a fresh local tarball with normalised metadata. It accepts any UTF-8 filename because a token can replace an entire filename and remove its original extension. It never modifies the returned archive.
