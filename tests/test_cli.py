@@ -5,7 +5,6 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 from deidentify.cli import main
 from deidentify.engine import audit_request
@@ -111,13 +110,11 @@ class CliTests(unittest.TestCase):
             (workspace / "internal-ai-review" / "responses" / batch["response_file"]).parent.mkdir(parents=True)
             (workspace / "internal-ai-review" / "responses" / batch["response_file"]).write_text(json.dumps(response), encoding="utf-8")
 
-            with patch("deidentify.cli.getpass.getpass", side_effect=["correct horse battery staple", "correct horse battery staple"]):
-                self.assertEqual(0, main(["package", str(source), "--workspace", str(workspace)]))
+            self.assertEqual(0, main(["package", str(source), "--workspace", str(workspace)]))
 
             fingerprint = json.loads((workspace / "fingerprint.json").read_text(encoding="utf-8"))
             self.assertEqual("approved", fingerprint["entries"][0]["status"])
             self.assertTrue((workspace / "source-deidentified.tar.gz").exists())
-            self.assertTrue((workspace / "source-deidentified.tar.gz.mapping.vault.json").exists())
 
     def test_compact_candidate_summary_supports_human_review_and_build_reporting(self):
         with tempfile.TemporaryDirectory() as name:

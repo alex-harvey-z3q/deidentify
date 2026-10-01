@@ -7,7 +7,6 @@ import re
 import stat
 import tarfile
 import tempfile
-from base64 import urlsafe_b64decode, urlsafe_b64encode
 from io import BytesIO
 from pathlib import PurePosixPath
 from collections import Counter, defaultdict
@@ -15,12 +14,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterable
 
-from cryptography.fernet import Fernet, InvalidToken
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 
-VERSION = "0.7.1"
+VERSION = "0.8.0"
 WINDOWS_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 DEFAULT_EXCLUDED_DIRS = {".git", ".hg", ".svn", "node_modules", "vendor", "dist", "build", ".venv", "venv", "__pycache__"}
 DEFAULT_EXCLUDED_FILE_NAMES = {".env", ".envrc", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"}
@@ -592,44 +588,12 @@ def approved_replacements(fingerprint: dict[str, Any]) -> list[tuple[str, str, s
     return sorted(replacements, key=lambda item: len(item[0]), reverse=True)
 
 
-def mapping_vault(fingerprint: dict[str, Any], passphrase: str, release_tree_digest: str | None = None) -> dict[str, Any]:
-    if not passphrase:
-        raise ValueError("Mapping-vault passphrase must not be empty")
-    token_map = mapping_from_fingerprint(fingerprint)
-    salt = os.urandom(16)
-    key = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=600_000).derive(passphrase.encode("utf-8"))
-    plaintext = json.dumps({"schema_version": 1, "token_map": token_map, "release_tree_digest": release_tree_digest}, sort_keys=True).encode("utf-8")
-    return {"schema_version": 1, "kdf": {"name": "PBKDF2-HMAC-SHA256", "iterations": 600_000, "salt": urlsafe_b64encode(salt).decode("ascii")}, "ciphertext": Fernet(urlsafe_b64encode(key)).encrypt(plaintext).decode("ascii")}
-
-
 def mapping_from_fingerprint(fingerprint: dict[str, Any]) -> dict[str, str]:
     replacements = approved_replacements(fingerprint)
     mapping = {token: variant for variant, token, _ in replacements}
     if not mapping or len(mapping) != len(replacements):
         raise ValueError("Approved mappings cannot be reconstructed unambiguously")
     return mapping
-
-
-def write_mapping_vault(path: Path, fingerprint: dict[str, Any], passphrase: str, release_tree_digest: str | None = None) -> None:
-    if path.exists():
-        raise ValueError(f"Refusing to overwrite existing mapping vault: {path}")
-    write_json(path, mapping_vault(fingerprint, passphrase, release_tree_digest))
-
-
-def decrypt_mapping_vault(path: Path, passphrase: str) -> dict[str, str]:
-    vault = load_json(path)
-    kdf = vault.get("kdf", {})
-    if vault.get("schema_version") != 1 or kdf.get("name") != "PBKDF2-HMAC-SHA256" or not isinstance(kdf.get("iterations"), int) or not isinstance(kdf.get("salt"), str) or not isinstance(vault.get("ciphertext"), str):
-        raise ValueError("Unsupported mapping vault")
-    try:
-        key = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=urlsafe_b64decode(kdf["salt"]), iterations=kdf["iterations"]).derive(passphrase.encode("utf-8"))
-        data = json.loads(Fernet(urlsafe_b64encode(key)).decrypt(vault["ciphertext"].encode("ascii")))
-    except (InvalidToken, ValueError, TypeError, UnicodeDecodeError) as exc:
-        raise ValueError("Could not decrypt mapping vault; check the passphrase and vault file") from exc
-    token_map = data.get("token_map") if isinstance(data, dict) else None
-    if not isinstance(token_map, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in token_map.items()):
-        raise ValueError("Mapping vault contains an invalid token map")
-    return token_map
 
 
 def replace_text(text: str, replacements: list[tuple[str, str, str]], *, case_insensitive: bool = True) -> tuple[str, set[str], int]:
@@ -846,9 +810,8 @@ def substantive_audit_findings(response: dict[str, Any], request: dict[str, Any]
     return [finding for finding in findings if finding["confidence"] in {"medium", "high"} and finding["finding_id"] not in dismissed]
 
 
-def build(source: Path, fingerprint: dict[str, Any], output: Path, unsupported_policy: str = "reject", audit: dict[str, Any] | None = None, audit_review: dict[str, Any] | None = None, fail_on_ai_findings: bool = False, vault_path: Path | None = None, vault_passphrase: str | None = None) -> dict[str, Any]:
+def build(source: Path, fingerprint: dict[str, Any], output: Path, unsupported_policy: str = "reject", audit: dict[str, Any] | None = None, audit_review: dict[str, Any] | None = None, fail_on_ai_findings: bool = False) -> dict[str, Any]:
     if fail_on_ai_findings and audit is None: raise ValueError("--fail-on-ai-findings requires an audit findings file")
-    if (vault_path is None) != (vault_passphrase is None): raise ValueError("A mapping vault path and passphrase must be supplied together")
     require_outside_source(source, output, "Archive output")
     if output.exists() or output.with_suffix(output.suffix + ".manifest.json").exists():
         raise ValueError("Refusing to overwrite an existing archive or manifest")
@@ -877,8 +840,6 @@ def build(source: Path, fingerprint: dict[str, Any], output: Path, unsupported_p
     checksum = hashlib.sha256(output.read_bytes()).hexdigest()
     manifest = {"schema_version": 4, "tool_version": VERSION, "created_at": utc_now(), "source_tree_digest": source_digest, "fingerprint_digest": current_fingerprint_digest, "transformed_tree_digest": release_digest, "tree_digest": release_digest, "archive": {"filename": output.name, "sha256": checksum, "file_count": len(plan), "metadata_normalised": True}, "fingerprint": {**approval_counts(fingerprint), "entries_applied": outcomes["directly_applied"], **outcomes}, "short_variant_risks": short_risks, "omitted_files": omitted, "final_check": {"passed": True, "unresolved_approved_variants": outcomes["unresolved"], "paths_checked": True}, "ai_audit": {"performed": audit is not None, "tree_digest": release_digest if audit is not None else None, "open_medium_or_high_findings": len(substantive)}, "notes": ["No original-to-replacement map is stored in this manifest."]}
     write_json(output.with_suffix(output.suffix + ".manifest.json"), manifest)
-    if vault_path is not None:
-        write_mapping_vault(vault_path, fingerprint, vault_passphrase or "", release_digest)
     return manifest
 
 
@@ -890,16 +851,13 @@ def safe_archive_relative(name: str) -> Path | None:
     return Path(*raw.parts)
 
 
-def reidentify(returned_archive: Path, vault_path: Path | None = None, output: Path | None = None, passphrase: str | None = None, *, fingerprint: dict[str, Any] | None = None, source: Path | None = None, output_dir: Path | None = None) -> dict[str, Any]:
+def reidentify(returned_archive: Path, *, fingerprint: dict[str, Any], source: Path | None = None, output_dir: Path) -> dict[str, Any]:
     """Reverse placeholders in a returned archive without changing unrelated returned bytes."""
-    if (fingerprint is None) == (vault_path is None): raise ValueError("Supply exactly one mapping source: fingerprint or mapping vault")
-    if (output is None) == (output_dir is None): raise ValueError("Supply exactly one output: archive output or output directory")
     if source is not None:
         if fingerprint is None: raise ValueError("Source verification requires a fingerprint")
         require_fingerprint_source(source, fingerprint)
-    if output is not None and output.exists(): raise ValueError("Refusing to overwrite an existing reidentified archive")
-    if output_dir is not None and output_dir.exists(): raise ValueError("Refusing to overwrite an existing reidentified output directory")
-    token_map = mapping_from_fingerprint(fingerprint) if fingerprint is not None else decrypt_mapping_vault(vault_path, passphrase or "")
+    if output_dir.exists(): raise ValueError("Refusing to overwrite an existing reidentified output directory")
+    token_map = mapping_from_fingerprint(fingerprint)
     replacements = sorted([(token, canonical, token) for token, canonical in token_map.items()], key=lambda item: len(item[0]), reverse=True)
     restored: list[tuple[Path, bytes, int]] = []; targets: set[str] = set(); directories: set[str] = set()
     try:
@@ -922,24 +880,15 @@ def reidentify(returned_archive: Path, vault_path: Path | None = None, output: P
             if text is None: changed, content_count = raw, 0
             else:
                 restored_text, _, content_count = replace_text(text, replacements, case_insensitive=False)
-                if remaining_approved(restored_text, replacements, case_insensitive=False): raise ValueError(f"Reidentification left vault tokens in {member.name}")
+                if remaining_approved(restored_text, replacements, case_insensitive=False): raise ValueError(f"Reidentification left placeholder tokens in {member.name}")
                 changed = restored_text.encode("utf-8")
-            if remaining_approved(target.as_posix(), replacements, case_insensitive=False): raise ValueError(f"Reidentification left vault tokens in {member.name}")
+            if remaining_approved(target.as_posix(), replacements, case_insensitive=False): raise ValueError(f"Reidentification left placeholder tokens in {member.name}")
             targets.add(target_name); restored.append((target, changed, path_count + content_count))
-    if output_dir is not None:
-        output_dir.mkdir(parents=True)
-        for directory in directories: (output_dir / directory).mkdir(parents=True, exist_ok=True)
-        for target, raw, _ in restored:
-            destination = output_dir / target; destination.parent.mkdir(parents=True, exist_ok=True); destination.write_bytes(raw)
-        manifest_path = output_dir.parent / f"{output_dir.name}.manifest.json"; archive = {"directory": output_dir.name, "file_count": len(restored)}
-    else:
-        assert output is not None; output.parent.mkdir(parents=True, exist_ok=True)
-        archive = {"filename": output.name, "file_count": len(restored), "metadata_normalised": True}; manifest_path = output.with_suffix(output.suffix + ".manifest.json")
-        archive_output = output
-        with tarfile.open(archive_output, "w:gz") as tar:
-            for target, raw, _ in sorted(restored, key=lambda item: item[0].as_posix()):
-                info = tarfile.TarInfo(target.as_posix()); info.size = len(raw); info.mode = 0o644; info.mtime = 0; tar.addfile(info, BytesIO(raw))
-        archive["sha256"] = hashlib.sha256(archive_output.read_bytes()).hexdigest()
+    output_dir.mkdir(parents=True)
+    for directory in directories: (output_dir / directory).mkdir(parents=True, exist_ok=True)
+    for target, raw, _ in restored:
+        destination = output_dir / target; destination.parent.mkdir(parents=True, exist_ok=True); destination.write_bytes(raw)
+    manifest_path = output_dir.parent / f"{output_dir.name}.manifest.json"; archive = {"directory": output_dir.name, "file_count": len(restored)}
     manifest = {"schema_version": 1, "tool_version": VERSION, "created_at": utc_now(), "archive": archive, "reidentified_token_occurrences": sum(count for _, _, count in restored)}
     write_json(manifest_path, manifest)
     return manifest

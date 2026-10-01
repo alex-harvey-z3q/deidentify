@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import getpass
 import shlex
 import sys
 from pathlib import Path
@@ -33,19 +32,11 @@ def workspace_paths(workspace: Path, source: Path) -> dict[str, Path]:
         "review_batches": workspace / "internal-ai-review" / "batches",
         "review_responses": workspace / "internal-ai-review" / "responses",
         "archive": workspace / bundle_name,
-        "vault": workspace / f"{bundle_name}.mapping.vault.json",
     }
 
 
 def source_root_name(source: Path) -> str:
     return source.absolute().resolve(strict=True).name
-
-
-def mapping_vault_passphrase() -> str:
-    passphrase = getpass.getpass("New mapping-vault passphrase: ")
-    if passphrase != getpass.getpass("Confirm mapping-vault passphrase: "):
-        raise ValueError("Mapping-vault passphrases do not match")
-    return passphrase
 
 
 def print_shell_summary(source: Path, workdir: Path, next_command: str) -> None:
@@ -119,15 +110,12 @@ def parser() -> argparse.ArgumentParser:
     build_cmd.add_argument("--audit-findings", type=Path)
     build_cmd.add_argument("--audit-review", type=Path, help="Human-reviewed audit dismissals bound to the current tree digest.")
     build_cmd.add_argument("--fail-on-ai-findings", action="store_true")
-    build_cmd.add_argument("--mapping-vault", type=Path, help="Write an encrypted token-to-canonical mapping outside the source tree.")
     package_cmd = commands.add_parser("package", help="Finish the short workflow: import and approve this AI review, then build a reversible bundle.")
     package_cmd.add_argument("source", type=Path)
     package_cmd.add_argument("--workspace", type=Path, required=True, help="Workspace previously created by prepare.")
     package_cmd.add_argument("--review", type=Path, help="Legacy single internal-AI response JSON; otherwise package reads all verified Copilot batch responses.")
     package_cmd.add_argument("--review-responses", type=Path, help="Directory containing the Copilot batch response JSON files.")
     package_cmd.add_argument("--output", type=Path, help="Archive output; defaults inside the workspace.")
-    package_cmd.add_argument("--mapping-vault", type=Path, help="Encrypted reverse map; defaults inside the workspace.")
-    package_cmd.add_argument("--no-mapping-vault", action="store_true", help="Do not create a reverse map; reidentification will not be possible.")
     package_cmd.add_argument("--unsupported-policy", choices=("reject", "exclude"), default="exclude", help="Defaults to exclude so non-text files do not block this streamlined workflow.")
     preview_cmd = commands.add_parser("preview", help="Show planned path/content changes without writing an archive.")
     preview_cmd.add_argument("source", type=Path)
@@ -149,15 +137,11 @@ def parser() -> argparse.ArgumentParser:
     audit_review_cmd.add_argument("audit_findings", type=Path)
     audit_review_cmd.add_argument("--output", type=Path, required=True)
     audit_review_cmd.add_argument("--unsupported-policy", choices=("reject", "exclude"), default="reject")
-    reidentify_cmd = commands.add_parser("reidentify", help="Restore returned placeholders using a fingerprint or encrypted mapping vault.")
+    reidentify_cmd = commands.add_parser("reidentify", help="Restore returned placeholders using a trusted fingerprint.")
     reidentify_cmd.add_argument("returned_archive", type=Path)
-    reidentify_cmd.add_argument("legacy_mapping_vault", type=Path, nargs="?")
-    reidentify_cmd.add_argument("legacy_output", type=Path, nargs="?")
     reidentify_cmd.add_argument("--fingerprint", type=Path)
-    reidentify_cmd.add_argument("--mapping-vault", type=Path)
     reidentify_cmd.add_argument("--source", type=Path)
-    reidentify_cmd.add_argument("--output", type=Path)
-    reidentify_cmd.add_argument("--output-dir", type=Path)
+    reidentify_cmd.add_argument("--output-dir", type=Path, required=True)
     return root
 
 
@@ -269,46 +253,35 @@ def main(argv: list[str] | None = None) -> int:
             write_json(args.fingerprint, fingerprint)
             print(f"Approved {approved} candidate entries.")
         elif args.command == "build":
-            require_workflow_artifacts_outside_source(args.source, fingerprint=args.fingerprint, audit_findings=args.audit_findings, human_audit_review=args.audit_review, mapping_vault=args.mapping_vault, archive_output=args.output)
+            require_workflow_artifacts_outside_source(args.source, fingerprint=args.fingerprint, audit_findings=args.audit_findings, human_audit_review=args.audit_review, archive_output=args.output)
             fingerprint = load_json(args.fingerprint)
             validate_fingerprint(fingerprint)
             audit = load_json(args.audit_findings) if args.audit_findings else None
             audit_review = load_json(args.audit_review) if args.audit_review else None
-            vault_passphrase = None
-            if args.mapping_vault:
-                vault_passphrase = mapping_vault_passphrase()
-            manifest = build(args.source, fingerprint, args.output, unsupported_policy=args.unsupported_policy, audit=audit, audit_review=audit_review, fail_on_ai_findings=args.fail_on_ai_findings, vault_path=args.mapping_vault, vault_passphrase=vault_passphrase)
+            manifest = build(args.source, fingerprint, args.output, unsupported_policy=args.unsupported_policy, audit=audit, audit_review=audit_review, fail_on_ai_findings=args.fail_on_ai_findings)
             print(f"Created archive: {args.output}")
             print(f"Manifest: {args.output.with_suffix(args.output.suffix + '.manifest.json')}")
             print_build_summary(manifest)
             if manifest["omitted_files"]:
                 print(f"Warning: {len(manifest['omitted_files'])} files/directories were omitted by policy.")
-            if args.mapping_vault:
-                print(f"Encrypted mapping vault: {args.mapping_vault}")
         elif args.command == "package":
             paths = workspace_paths(args.workspace, args.source)
-            if args.no_mapping_vault and args.mapping_vault:
-                raise ValueError("--no-mapping-vault cannot be combined with --mapping-vault")
             if args.review and args.review_responses:
                 raise ValueError("--review cannot be combined with --review-responses")
             review_path = args.review
             responses_directory = args.review_responses or paths["review_responses"]
             output = args.output or paths["archive"]
-            vault_path = None if args.no_mapping_vault else (args.mapping_vault or paths["vault"])
-            require_workflow_artifacts_outside_source(args.source, fingerprint=paths["fingerprint"], ai_review_response=review_path, copilot_review_responses=responses_directory, archive_output=output, mapping_vault=vault_path)
-            vault_passphrase = mapping_vault_passphrase() if vault_path else None
+            require_workflow_artifacts_outside_source(args.source, fingerprint=paths["fingerprint"], ai_review_response=review_path, copilot_review_responses=responses_directory, archive_output=output)
             review = load_json(review_path) if review_path else merge_review_batch_responses(load_json(paths["review_index"]), responses_directory)
             fingerprint, added, updated, approved = import_review(load_json(paths["fingerprint"]), review, approve_all=True, approval_source="local_cli_package")
             write_json(paths["fingerprint"], fingerprint)
-            manifest = build(args.source, fingerprint, output, unsupported_policy=args.unsupported_policy, vault_path=vault_path, vault_passphrase=vault_passphrase)
+            manifest = build(args.source, fingerprint, output, unsupported_policy=args.unsupported_policy)
             print(f"Imported review: {added} entries added, {updated} entries updated; approved {approved} touched entries.")
             print(f"Created archive: {output}")
             print(f"Manifest: {output.with_suffix(output.suffix + '.manifest.json')}")
             print_build_summary(manifest)
             if manifest["omitted_files"]:
                 print(f"Warning: {len(manifest['omitted_files'])} files/directories were omitted by policy.")
-            if vault_path:
-                print(f"Encrypted mapping vault: {vault_path}")
         elif args.command == "preview":
             require_workflow_artifacts_outside_source(args.source, fingerprint=args.fingerprint, preview_output=args.output)
             fingerprint = load_json(args.fingerprint)
@@ -329,12 +302,9 @@ def main(argv: list[str] | None = None) -> int:
             write_json(args.output, audit_review_template(source=args.source, fingerprint=fingerprint, audit=load_json(args.audit_findings), unsupported_policy=args.unsupported_policy))
             print(f"Human audit-review template: {args.output}")
         elif args.command == "reidentify":
-            vault = args.mapping_vault or args.legacy_mapping_vault; output = args.output or args.legacy_output
-            if args.mapping_vault and args.legacy_mapping_vault: raise ValueError("Use either --mapping-vault or legacy positional vault syntax")
-            if args.fingerprint and vault: raise ValueError("Use exactly one of --fingerprint or --mapping-vault")
-            fingerprint = load_json(args.fingerprint) if args.fingerprint else None
-            manifest = reidentify(args.returned_archive, vault_path=vault, output=output, passphrase=getpass.getpass("Mapping-vault passphrase: ") if vault else None, fingerprint=fingerprint, source=args.source, output_dir=args.output_dir)
-            print(f"Created reidentified {'directory' if args.output_dir else 'archive'}: {args.output_dir or output}")
+            if args.fingerprint is None: raise ValueError("--fingerprint is required")
+            reidentify(args.returned_archive, fingerprint=load_json(args.fingerprint), source=args.source, output_dir=args.output_dir)
+            print(f"Created reidentified directory: {args.output_dir}")
             print(f"Restored {manifest['reidentified_token_occurrences']} token occurrences to their original exact values.")
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
