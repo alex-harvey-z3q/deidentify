@@ -3,7 +3,9 @@ import os
 import subprocess
 import sys
 import tempfile
+import tarfile
 import unittest
+from io import BytesIO
 from pathlib import Path
 
 from deidentify.cli import main
@@ -92,6 +94,18 @@ class CliTests(unittest.TestCase):
             self.assertEqual(0, all_candidates.returncode, all_candidates.stderr); self.assertIn("Approved 1 candidate entries", all_candidates.stdout)
             statuses = {entry["canonical"]: entry["status"] for entry in json.loads(fingerprint_path.read_text())["entries"]}
             self.assertEqual("approved", statuses["Existing"])
+
+    def test_actual_cli_reidentify_uses_fingerprint_and_reports_restored_tokens(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); returned = root / "returned.tar.gz"; fingerprint = root / "fingerprint.json"; output_dir = root / "restored"
+            fingerprint.write_text(json.dumps({"schema_version": 1, "entries": [{"canonical": "Orion", "category": "project", "variants": ["Orion"], "status": "approved"}]}), encoding="utf-8")
+            raw = b"name: __PROJECT_001__\n"
+            with tarfile.open(returned, "w:gz") as archive:
+                info = tarfile.TarInfo("__PROJECT_001__/edited.yml"); info.size = len(raw); archive.addfile(info, BytesIO(raw))
+            result = self.run_cli("reidentify", str(returned), "--fingerprint", str(fingerprint), "--output-dir", str(output_dir))
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual("name: Orion\n", (output_dir / "Orion" / "edited.yml").read_text(encoding="utf-8"))
+            self.assertIn("Restored 2 token occurrences", result.stdout)
 
     def test_short_workflow_prepares_then_packages_a_reversible_bundle(self):
         with tempfile.TemporaryDirectory() as name:

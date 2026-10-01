@@ -303,7 +303,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Human audit-review template: {args.output}")
         elif args.command == "reidentify":
             if args.fingerprint is None: raise ValueError("--fingerprint is required")
-            reidentify(args.returned_archive, fingerprint=load_json(args.fingerprint), source=args.source, output_dir=args.output_dir)
+            manifest = reidentify(args.returned_archive, fingerprint=load_json(args.fingerprint), source=args.source, output_dir=args.output_dir)
             print(f"Created reidentified directory: {args.output_dir}")
             print(f"Restored {manifest['reidentified_token_occurrences']} token occurrences to their original exact values.")
     except ValueError as exc:
